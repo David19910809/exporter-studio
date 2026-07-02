@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Exporter 企业版本管理工具</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <strong>EVM</strong>
+          <span>Exporter 版本治理</span>
+        </div>
+        <nav class="nav-menu" aria-label="主导航">
+          <button class="nav-item active" data-view="dashboard">工作台</button>
+          <button class="nav-item" data-view="governance">版本治理</button>
+          <button class="nav-item" data-view="custom">定制开发</button>
+          <button class="nav-item" data-view="delivery">发布运行</button>
+          <button class="nav-item" data-view="activity">操作记录</button>
+        </nav>
+      </aside>
+
+      <div class="main-shell">
+        <header class="topbar">
+          <div>
+            <h1 id="viewTitle">工作台</h1>
+            <p id="viewSubtitle">围绕官方基线、企业分支、能力包和构建发布维护 exporter 企业版本。</p>
+          </div>
+        </header>
+
+        <main class="content">
+          <section class="view active" data-view-panel="dashboard">
+            <section class="overview" id="overview"></section>
+            <section class="quick-actions">
+              <button class="quick-card" data-goto="governance">
+                <strong>1. 维护企业版本</strong>
+                <span>同步官方 release，维护 upstream/main、官方基线、cmg branch 和管理责任人。</span>
+              </button>
+              <button class="quick-card" data-goto="custom">
+                <strong>2. 沉淀能力包</strong>
+                <span>通过固定扩展点编辑可复用 custom 能力包，不绑定单一 exporter 版本。</span>
+              </button>
+              <button class="quick-card" data-goto="delivery">
+                <strong>3. 装配并发布</strong>
+                <span>选择企业版本、官方包、能力包和手工配置，生成内部构建与下载文件。</span>
+              </button>
+            </section>
+            <div class="two-column">
+              <section class="panel">
+                <div class="panel-title">
+                  <div>
+                    <h2>版本治理关系</h2>
+                    <p>官方 upstream、company/ext、custom/custom.yaml 和企业发行版本</p>
+                  </div>
+                </div>
+                <div id="versionFlow" class="flow"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-title">
+                  <div>
+                    <h2>当前 Exporter</h2>
+                    <p>官方基线、本地版本、稳定扩展接口和装配清单</p>
+                  </div>
+                </div>
+                <div id="currentExporter" class="kv"></div>
+              </section>
+            </div>
+          </section>
+
+          <section class="view" data-view-panel="governance">
+            <section class="practice-strip">
+              <strong>版本管理最佳实践</strong>
+              <span>官方版本只作为 upstream 基线；企业版本只维护管理归属和当前本地版本；custom 能力包在发布运行时选择装配；cmg branch、company/ext、custom 目录、hook 和 lock 文件由系统生成，不手动填写。</span>
+            </section>
+            <div class="two-column">
+              <section class="panel">
+                <div class="panel-title">
+                  <div>
+                    <h2>企业版本列表</h2>
+                    <p>默认展示已保存企业版本，点击新增或编辑时再维护元数据。</p>
+                  </div>
+                  <div class="panel-actions">
+                    <button id="openVersionModalBtn">新增企业版本</button>
+                  </div>
+                </div>
+                <div id="exporterVersionList" class="version-list"></div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-title">
+                  <div>
+                    <h2>Exporter 版本目录</h2>
+                    <p>统一维护官方 release 和手动上传的固定官方版本包。</p>
+                  </div>
+                  <div class="panel-actions">
+                    <span id="catalogSyncStatus" class="inline-status"></span>
+                    <button id="openCatalogUploadBtn" class="secondary">上传版本包</button>
+                    <button id="syncCatalogBtn2">同步目录</button>
+                  </div>
+                </div>
+                <div id="catalogUploadPanel" class="catalog-upload-panel hidden">
+                  <label>Exporter 目录<select id="uploadCatalogId"></select></label>
+                  <label>版本号<input id="uploadOfficialVersion" placeholder="例如 v0.30.1"></label>
+                  <label>版本文件<input id="officialPackageFile" type="file"></label>
+                  <label>版本说明<input id="officialUploadNote" value="手动上传的固定官方版本包"></label>
+                  <div class="panel-actions">
+                    <span id="officialUploadStatus" class="inline-status"></span>
+                    <button id="uploadOfficialBtn" type="button">保存到目录</button>
+                  </div>
+                </div>
+                <div id="catalogList" class="table compact-table"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="versionModal" class="modal-backdrop hidden" aria-hidden="true">
+            <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="versionModalTitle">
+              <div class="modal-head">
+                <div>
+                  <h2 id="versionModalTitle">新增企业版本</h2>
+                  <p>官方基线和企业管理信息分开维护，构建时再选择需要装配的能力包。</p>
+                </div>
+                <button id="closeVersionModalBtn" class="secondary">关闭</button>
+              </div>
+
+              <div class="version-meta-layout">
+                <section class="meta-card official-card">
+                  <div class="meta-card-head">
+                    <span class="meta-index">01</span>
+                    <div>
+                      <h3>官方基线信息</h3>
+                      <p>选择已同步或手动上传的官方版本包，作为企业版本基线。</p>
+                    </div>
+                  </div>
+                  <form class="form-grid single">
+                    <input id="enterpriseVersionId" type="hidden">
+                    <label>Exporter 名称<select id="exporterName"></select><small class="field-note">从 Exporter 版本目录选择；官方仓库地址由系统维护，不需要填写。</small></label>
+                    <label class="system-field">官方 Git 仓库<input id="officialRepo" value="https://github.com/prometheus/snmp_exporter"></label>
+                    <label class="system-field">upstream remote<input id="upstreamRemote" value="upstream"></label>
+                    <label class="system-field">官方主分支<input id="officialBranch" value="main"></label>
+                    <label>官方版本包<select id="officialPackageId"></select><small class="field-note">最佳实践：只从版本目录选择官方基线，不手写版本号。</small></label>
+                    <label>官方基线版本<input id="officialBaseline" value="v0.30.0" readonly><small class="field-note">由官方版本包自动带出，用于 Git upstream 基线和差异比对。</small></label>
+                    <label>小版本备注<input id="minorVersionNote" placeholder="例如：Windows 认证验证版、SNMP 固定兼容版"><small class="field-note">用于区分同一 exporter 的不同小版本企业版，会在列表中以彩色标签展示。</small></label>
+                  </form>
+                </section>
+
+                <div class="meta-bridge">
+                  <span>upstream/main</span>
+                  <strong>-></strong>
+                  <span>cmg branch</span>
+                </div>
+
+                <section class="meta-card company-card">
+                  <div class="meta-card-head">
+                    <span class="meta-index">02</span>
+                    <div>
+                      <h3>企业版本信息</h3>
+                      <p>维护监控系统、部门、联系人、企业分支和稳定扩展接口。</p>
+                    </div>
+                  </div>
+                  <form class="form-grid single">
+                    <label>监控系统<input id="monitoringSystem" value="统一监控平台"><small class="field-note">可不填；为空时记为“未登记”，不影响构建。</small></label>
+                    <label>部门<input id="department" value="网络运维部"><small class="field-note">可不填；建议填写责任部门，方便后续版本归属追踪。</small></label>
+                    <label>联系人<input id="contactName" value="张工"><small class="field-note">可不填；建议填写版本负责人。</small></label>
+                    <label>联系方式<input id="contactInfo" value="ops@example.com"><small class="field-note">可不填；仅用于版本归属说明。</small></label>
+                    <label class="system-field">cmg branch<input id="companyBranch" value="cmg/snmp_exporter"></label>
+                    <label class="system-field">企业本地版本<input id="localVersion" value="snmp_exporter-internal-1.0.0"></label>
+                    <label class="system-field">custom 目录<input id="customDir" value="custom"></label>
+                    <label class="system-field">company/ext hook 文件<input id="registryHookFile" value="company/ext/registry.go"></label>
+                    <label class="system-field">company/ext hook 符号<input id="registryHookSymbol" value="RegisterCompanyExt"></label>
+                    <div class="system-note span-2">
+                      <strong>系统自动维护：</strong>
+                      <span id="versionDefaultsNote">转换规则：Exporter 选择 snmp_exporter 且企业信息不填写时，系统默认生成 cmg/snmp_exporter 分支和 snmp_exporter-internal-1.0.0 企业版本；custom/custom.yaml、company/ext hook 和构建锁定文件均由系统生成。</span>
+                    </div>
+                  </form>
+                </section>
+              </div>
+
+              <div class="modal-foot">
+                <span id="saveExporterStatus" class="inline-status"></span>
+                <button id="cancelVersionModalBtn" class="secondary">取消</button>
+                <button id="saveExporterBtn">保存企业版本</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="view" data-view-panel="custom">
+            <section class="panel">
+              <div class="panel-title">
+                <div>
+                  <h2>能力包资产库</h2>
+                  <p>能力包通过固定扩展点维护，可被不同企业版本在构建时选择装配。</p>
+                </div>
+                <div class="panel-actions">
+                  <span id="capabilityListStatus" class="inline-status"></span>
+                  <button id="openCapabilityModalBtn">新增能力包</button>
+                </div>
+              </div>
+              <div id="capabilityPackageList" class="table"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-title">
+                <div>
+                  <h2>扩展点规范</h2>
+                  <p>平台只暴露固定代码入口，能力包以源码方式在构建期编译进企业版 exporter。</p>
+                </div>
+              </div>
+              <div id="extensionPointList" class="extension-list horizontal"></div>
+            </section>
+          </section>
+
+          <section id="capabilityModal" class="modal-backdrop hidden" aria-hidden="true">
+            <div class="modal-panel capability-modal" role="dialog" aria-modal="true" aria-labelledby="capabilityModalTitle">
+              <div class="modal-head">
+                <div>
+                  <h2 id="capabilityModalTitle">新增能力包</h2>
+                  <p>只编辑平台暴露的代码区域，保存后进入能力包资产库，发布时再选择装配。</p>
+                </div>
+                <button id="closeCapabilityModalBtn" class="secondary">关闭</button>
+              </div>
+
+              <div class="capability-editor-layout">
+                <section class="meta-card">
+                  <div class="meta-card-head">
+                    <span class="meta-index">01</span>
+                    <div>
+                      <h3>能力包信息</h3>
+                      <p>定义可复用资产的身份、类型、负责人和源码位置。</p>
+                    </div>
+                  </div>
+                  <form class="form-grid single">
+                    <label>能力包 ID<input id="customId" value="pkg-http-health"></label>
+                    <label>能力包名称<input id="customName" value="HTTP 健康探测指标"></label>
+                    <label>扩展点<select id="customType"></select></label>
+                    <label>版本<input id="packageVersion" value="1.0.0"></label>
+                    <label>负责人<input id="packageOwner" value="平台团队"></label>
+                    <label class="system-field">源码路径<input id="customPath" value="custom/capabilities/pkg-http-health/scraper/http_health.go"></label>
+                    <label>说明<input id="customDescription" value="访问内部 HTTP 服务并转换为 exporter 指标。"></label>
+                  </form>
+                </section>
+
+                <section class="meta-card editor-panel">
+                  <div class="panel-title compact">
+                    <div>
+                      <h3 id="selectedExtensionTitle">扩展点代码</h3>
+                      <p id="selectedExtensionDesc">编辑能力包的受控代码区域。</p>
+                    </div>
+                    <div class="actions">
+                      <button id="resetTemplateBtn" class="secondary" type="button">恢复模板</button>
+                      <span id="validationBadge" class="badge status-pending">待校验</span>
+                    </div>
+                  </div>
+                  <div class="github-code-frame">
+                    <div class="code-frame-head">
+                      <span id="editableCodeFile">custom/capabilities/package.go</span>
+                      <span>editable</span>
+                    </div>
+                    <textarea id="editableCode" spellcheck="false"></textarea>
+                  </div>
+                  <div class="code-example-block">
+                    <div class="code-frame-head">
+                      <span id="codeExampleTitle">当前扩展点样例</span>
+                      <span>example</span>
+                    </div>
+                    <pre id="extensionCodeExample"></pre>
+                  </div>
+                </section>
+
+                <section class="meta-card">
+                  <div class="panel-title compact">
+                    <div>
+                      <h3>生成预览</h3>
+                      <p>exporter-builder 构建前会生成装配代码和锁定文件。</p>
+                    </div>
+                  </div>
+                  <div id="customImpact" class="kv"></div>
+                  <div class="github-code-frame">
+                    <div class="code-frame-head">
+                      <span>generated/preview.go</span>
+                      <span>preview</span>
+                    </div>
+                    <pre id="generatedCodePreview"></pre>
+                  </div>
+                </section>
+              </div>
+
+              <div class="modal-foot">
+                <span id="capabilitySaveStatus" class="inline-status"></span>
+                <button id="cancelCapabilityModalBtn" class="secondary">取消</button>
+                <button id="addCustomBtn">保存能力包</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="view" data-view-panel="delivery">
+            <section class="panel">
+              <div class="panel-title">
+                <div>
+                  <h2>构建发布记录</h2>
+                  <p>构建后可下载内部版本说明、.exporter.yaml、custom/custom.yaml、lock、build-info 和装配代码。</p>
+                </div>
+                <button id="openBuildModalBtn">开始构建</button>
+              </div>
+              <div class="build-record-toolbar">
+                <input id="buildSearchInput" placeholder="搜索版本、状态、基线、能力包、标签、操作人">
+              </div>
+              <div id="buildList" class="table"></div>
+            </section>
+          </section>
+
+          <section id="buildModal" class="modal-backdrop hidden" aria-hidden="true">
+            <div class="modal-panel build-modal" role="dialog" aria-modal="true" aria-labelledby="buildModalTitle">
+              <div class="modal-head">
+                <div>
+                  <h2 id="buildModalTitle">企业版装配构建</h2>
+                  <p>选择企业版本、官方基线包和能力包，补充手工维护内容后生成内部版本。</p>
+                </div>
+                <button id="closeBuildModalBtn" class="secondary">关闭</button>
+              </div>
+              <div class="build-wizard">
+                <section class="build-step">
+                  <span class="step-index">01</span>
+                  <div>
+                    <h3>选择版本基线</h3>
+                    <div class="form-grid">
+                      <label>企业版本<select id="buildExporterSelect"></select><small class="field-note">选择要发布的企业分支，系统会沿用其官方基线和管理归属。</small></label>
+                      <label>官方版本包<select id="buildOfficialPackageSelect"></select><small class="field-note">构建只能从已同步或已上传的官方版本包中选择。</small></label>
+                      <label>发布版本号<input id="buildVersion" placeholder="不填则自动生成"><small class="field-note">建议使用自动生成；手填时应包含 exporter 名称、企业标识和递增号。</small></label>
+                      <label>操作人<input id="buildOperator" value="平台团队"><small class="field-note">用于构建审计和发布记录追踪。</small></label>
+                      <label class="span-2">构建标签<input id="buildTags" placeholder="例如：认证, Windows, 回归验证"><small class="field-note">多个标签可用逗号、空格或顿号分隔，用于构建记录搜索。</small></label>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="build-step">
+                  <span class="step-index">02</span>
+                  <div>
+                    <h3>选择能力包</h3>
+                    <div id="buildPackageChecklist" class="package-checklist"></div>
+                  </div>
+                </section>
+
+                <section class="build-step">
+                  <span class="step-index">03</span>
+                  <div>
+                    <h3>补充手工维护内容</h3>
+                    <div class="form-grid">
+                      <label>发布说明<input id="buildNote" value="企业内部版本发布"><small class="field-note">写清楚本次发布目的，便于回滚和审计。</small></label>
+                      <label>版本补丁说明<input id="buildPatchNote" value="仅保留必要 company/ext 接入点"><small class="field-note">这里只记录主干侵入补丁，能力包不要写成补丁。</small></label>
+                      <label class="span-2">构建参数<input id="buildArgs" value="GOOS=linux GOARCH=amd64"><small class="field-note">默认即可；只有跨平台或特殊 collector 参数才需要修改。</small></label>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="build-step">
+                  <span class="step-index">04</span>
+                  <div>
+                    <h3>自动装配预览</h3>
+                    <div id="buildAssemblyPreview" class="assembly-preview"></div>
+                  </div>
+                </section>
+              </div>
+              <div class="modal-foot">
+                <button id="cancelBuildModalBtn" class="secondary">取消</button>
+                <button id="buildBtn2">开始装配构建</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="view" data-view-panel="activity">
+            <section class="panel">
+              <div class="panel-title">
+                <div>
+                  <h2>操作记录</h2>
+                  <p>记录目录同步、元数据维护、能力包保存和构建发布动作。</p>
+                </div>
+              </div>
+              <div id="activityLog" class="activity-log"></div>
+            </section>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <section id="buildOverlay" class="build-overlay hidden" aria-hidden="true">
+      <div class="build-console" role="dialog" aria-modal="true" aria-labelledby="buildOverlayTitle">
+        <div class="build-console-head">
+          <div>
+            <h2 id="buildOverlayTitle">企业版构建</h2>
+            <p id="buildOverlaySummary">准备执行 exporter-builder</p>
+          </div>
+          <button id="closeBuildOverlayBtn" class="secondary" disabled>关闭</button>
+        </div>
+        <div class="build-progress">
+          <div class="build-progress-track">
+            <div id="buildProgressFill" class="build-progress-fill"></div>
+          </div>
+          <span id="buildProgressText">0%</span>
+        </div>
+        <pre id="buildLogOutput" class="build-log-output"></pre>
+      </div>
+    </section>
+
+    <section id="buildPreviewDrawer" class="drawer-backdrop hidden" aria-hidden="true">
+      <aside class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="buildPreviewTitle">
+        <div class="drawer-head">
+          <div>
+            <h2 id="buildPreviewTitle">构建文件预览</h2>
+            <p id="buildPreviewMeta">YAML、代码和构建日志会在这里展示。</p>
+          </div>
+          <button id="closeBuildPreviewBtn" class="secondary">关闭</button>
+        </div>
+        <pre id="buildPreviewContent"></pre>
+      </aside>
+    </section>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

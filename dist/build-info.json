@@ -1,0 +1,20 @@
+{
+  "builder": "exporter-builder",
+  "schemaVersion": "v1",
+  "modulePath": "example.com/exporter",
+  "stableHook": "company/ext/registry.go:RegisterCompanyExt",
+  "mainHookImport": "_ \"example.com/exporter/custom/all\"",
+  "inputs": [
+    "custom/custom.yaml"
+  ],
+  "generatedFiles": [
+    "custom/all/all_gen.go",
+    "company/ext/capabilities_gen.go",
+    "custom/custom.lock.yaml",
+    "dist/build-info.json"
+  ],
+  "selectedPackages": [
+    "authtest"
+  ],
+  "generatedAt": "2026-07-01T07:41:05.338Z"
+}

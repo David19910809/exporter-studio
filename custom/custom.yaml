@@ -1,0 +1,9 @@
+schemaVersion: v1
+kind: capability-package-selection
+module_path: example.com/exporter
+custom_dir: custom
+stable_hook: company/ext/registry.go:RegisterCompanyExt
+packages:
+  - name: authtest
+    kind: security
+    enabled: true

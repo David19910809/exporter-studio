@@ -1,0 +1,22 @@
+{
+  "name": "exporter-lifecycle-management-platform",
+  "version": "0.1.0",
+  "description": "MVP Exporter Lifecycle Management Platform for base versions, patch DSL, semantic diff, and release simulation.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "generate:capabilities": "node scripts/exporter-builder.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "exporter",
+    "lifecycle",
+    "patch",
+    "diff"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
+}

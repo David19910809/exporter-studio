@@ -1,0 +1,10 @@
+schemaVersion: v1
+generated_by: exporter-builder
+generated_at: 2026-07-01T07:41:05.337Z
+packages:
+  - name: authtest
+    kind: security
+    version: 1.0.0
+    import_path: example.com/exporter/custom/capabilities/authtest
+    source: custom/capabilities/authtest
+    checksum: aab25b916ce144ff6caeef9792f7800d2c4e922dbe0d6566e4c06a0e0e831d9d
