@@ -92,6 +92,37 @@ test("build records support tags and deletion", () => {
   assert.equal(getDashboard().exporter.builds.some((item) => item.id === build.id), false);
 });
 
+test("build target can be manually selected for arm and amd architectures", () => {
+  resetState();
+  const arm64Build = createBuild({
+    version: "snmp_exporter-arm64-build",
+    targetOs: "linux",
+    targetArch: "arm64"
+  });
+  assert.equal(arm64Build.target.os, "linux");
+  assert.equal(arm64Build.target.arch, "arm64");
+  assert.equal(arm64Build.target.source, "manual");
+  assert.equal(arm64Build.compiledBinary.target.arch, "arm64");
+  assert.equal(arm64Build.compiledBinary.fileName.endsWith(".exe"), false);
+
+  const armv7Build = createBuild({
+    version: "snmp_exporter-armv7-build",
+    targetOs: "linux",
+    targetArch: "arm",
+    targetArm: "7"
+  });
+  assert.equal(armv7Build.target.label, "linux/armv7");
+  assert.equal(armv7Build.compiledBinary.target.arm, "7");
+
+  const amd64Build = createBuild({
+    version: "snmp_exporter-amd64-build",
+    targetOs: "linux",
+    targetArch: "amd64"
+  });
+  assert.equal(amd64Build.target.label, "linux/amd64");
+  assert.equal(amd64Build.compiledBinary.target.arch, "amd64");
+});
+
 test("build downloads are resolved by build id across enterprise versions", () => {
   resetState();
   const firstBuild = createBuild({

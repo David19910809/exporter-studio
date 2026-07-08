@@ -490,8 +490,9 @@ function createBuild(input = {}) {
   const version = requestedVersion && requestedVersion.startsWith(`${exporter.name}-`)
     ? requestedVersion
     : `${exporter.localVersion}+custom.${sequence}`;
+  const target = resolveBuildTarget(exporter, selectedPackage, input);
   const lockFile = createCustomLock(exporter, selectedPackages, version);
-  const buildConfig = createBuildConfig(exporter, selectedPackages, input);
+  const buildConfig = createBuildConfig(exporter, selectedPackages, { ...input, target });
   const build = {
     id: `build-${Date.now()}`,
     exporterName: exporter.name,
@@ -504,7 +505,7 @@ function createBuild(input = {}) {
     officialPackageSource: exporter.officialPackageSource || "",
     officialPackageFileName: exporter.officialPackageFileName || "",
     officialPackage: selectedPackage || null,
-    target: resolveBuildTarget(exporter, selectedPackage),
+    target,
     customCount: selectedPackages.length,
     customItemIds: selectedPackages.map((item) => item.selectionId || item.id),
     customItemNames: selectedPackages.map((item) => item.name),
@@ -527,7 +528,8 @@ function createBuild(input = {}) {
       note: clean(input.note || ""),
       patchNote: clean(input.patchNote || ""),
       args: clean(input.args || ""),
-      operator: clean(input.operator || "")
+      operator: clean(input.operator || ""),
+      target
     },
     tags: normalizeTags(input.tags),
     buildInfo: {
@@ -535,7 +537,7 @@ function createBuild(input = {}) {
       exporter: exporter.id,
       version,
       baseline: exporter.officialBaseline,
-      target: resolveBuildTarget(exporter, selectedPackage),
+      target,
       packageCount: selectedPackages.length,
       assemblyValidation,
       generatedFiles: [
@@ -872,7 +874,7 @@ function buildRealExporterArtifact(exporter, build) {
   writeBuildDirectory(buildRoot, packageFiles);
 
   const verification = verifyGoSourceAssembly(buildRoot);
-  const compiledBinary = compileGoExecutable(buildRoot, build);
+  const compiledBinary = compileExporterExecutable(buildRoot, build, exporter);
   build.verification = verification;
   build.compiledBinary = compiledBinary;
   build.status = verification.ok && compiledBinary.ok && (build.assemblyValidation?.ok ?? true) ? "success" : "failed";
@@ -918,7 +920,19 @@ function writeBuildDirectory(buildRoot, files) {
   });
 }
 
-function resolveBuildTarget(exporter, officialPackage) {
+function resolveBuildTarget(exporter, officialPackage, input = {}) {
+  const requestedOs = clean(input.targetOs || input.goos || input.os || input.target?.os || "");
+  const requestedArch = normalizeGoArch(input.targetArch || input.goarch || input.arch || input.target?.arch || "");
+  if (isConcreteGoOS(requestedOs) && requestedArch) {
+    const requestedArm = requestedArch === "arm" ? normalizeGoArm(input.targetArm || input.goarm || input.arm || input.target?.arm || "") : "";
+    return {
+      os: requestedOs,
+      arch: requestedArch,
+      ...(requestedArm ? { arm: requestedArm } : {}),
+      source: "manual",
+      label: `${requestedOs}/${requestedArch}${requestedArm ? `v${requestedArm}` : ""}`
+    };
+  }
   const inferred = inferReleaseAsset(officialPackage?.fileName || "");
   const rawOs = clean(officialPackage?.os || "");
   const packageOs = isConcreteGoOS(rawOs) ? rawOs : inferred.os;
@@ -977,6 +991,206 @@ function normalizeGoArch(value) {
 function normalizeGoArm(value) {
   const match = clean(value).toLowerCase().match(/^v?([567])$|armv([567])/);
   return match ? (match[1] || match[2]) : "";
+}
+
+function compileExporterExecutable(buildRoot, build, exporter) {
+  const officialSource = compileOfficialSourceExecutable(buildRoot, build, exporter);
+  if (officialSource.ok) return officialSource;
+  const generated = compileGoExecutable(buildRoot, build);
+  return {
+    ...generated,
+    source: generated.source || "generated-assembly",
+    fallbackReason: officialSource.message || officialSource.stderr || officialSource.reason || ""
+  };
+}
+
+function compileOfficialSourceExecutable(buildRoot, build, exporter) {
+  if (!build.officialAsset?.available || clean(build.officialAsset.assetType) !== "source-archive") {
+    return { ok: false, source: "official-source", reason: "official source archive is not available" };
+  }
+  const sourceArchive = resolveBuildFile(path.join(".elmp", "builds", sanitizeFileName(build.id), build.officialAsset.packagePath));
+  if (!sourceArchive || !fs.existsSync(sourceArchive)) {
+    return { ok: false, source: "official-source", reason: "official source archive file is missing" };
+  }
+  const sourceRoot = path.join(buildRoot, "official-source");
+  try {
+    extractTarGzStripRoot(sourceArchive, sourceRoot);
+  } catch (error) {
+    return {
+      ok: false,
+      source: "official-source",
+      reason: `official source archive could not be extracted: ${error.message}`
+    };
+  }
+  if (!fs.existsSync(path.join(sourceRoot, "go.mod"))) {
+    return { ok: false, source: "official-source", reason: "official source archive does not contain go.mod at repository root" };
+  }
+  const modulePath = readGoModulePath(sourceRoot);
+  const hook = installOfficialSourceHook(sourceRoot, exporter, build, modulePath);
+  if (!hook.ok) return hook;
+
+  const target = normalizeBuildTarget(build.target);
+  const extension = target.os === "windows" ? ".exe" : "";
+  const fileName = `${sanitizeFileName(exporter.name || build.exporterName || "exporter")}-${sanitizeFileName(build.id || "build")}${extension}`;
+  const packagePath = `dist/${fileName}`;
+  const output = path.join(buildRoot, packagePath);
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  const env = {
+    ...process.env,
+    GOOS: target.os,
+    GOARCH: target.arch,
+    ...(target.arm ? { GOARM: target.arm } : {})
+  };
+  const result = spawnSync("go", ["build", "-o", output, "."], {
+    cwd: sourceRoot,
+    encoding: "utf8",
+    env,
+    timeout: 180000
+  });
+  if (result.status !== 0 || !fs.existsSync(output)) {
+    return {
+      ok: false,
+      source: "official-source",
+      command: `GOOS=${target.os} GOARCH=${target.arch}${target.arm ? ` GOARM=${target.arm}` : ""} go build -o ${packagePath} .`,
+      packagePath,
+      target,
+      message: "Official exporter source build failed",
+      stdout: clean(result.stdout || ""),
+      stderr: clean(result.stderr || result.error?.message || "")
+    };
+  }
+  const body = fs.readFileSync(output);
+  return {
+    ok: true,
+    source: "official-source",
+    command: `GOOS=${target.os} GOARCH=${target.arch}${target.arm ? ` GOARM=${target.arm}` : ""} go build -o ${packagePath} .`,
+    target,
+    packagePath,
+    path: relativePath(output),
+    fileName,
+    size: body.length,
+    sha256: crypto.createHash("sha256").update(body).digest("hex"),
+    message: "Official exporter source built successfully"
+  };
+}
+
+function readGoModulePath(sourceRoot) {
+  const goMod = path.join(sourceRoot, "go.mod");
+  if (!fs.existsSync(goMod)) return "";
+  const match = fs.readFileSync(goMod, "utf8").match(/^module\s+(.+)$/m);
+  return clean(match?.[1] || "");
+}
+
+function installOfficialSourceHook(sourceRoot, exporter, build, modulePath) {
+  if (!modulePath) return { ok: false, source: "official-source", reason: "official source go.mod does not declare a module path" };
+  const officialExporter = {
+    ...exporter,
+    exporterConfig: {
+      ...(exporter.exporterConfig || {}),
+      modulePath
+    }
+  };
+  const officialBuild = {
+    ...build,
+    selectedPackages: withModulePathForPackages(build.selectedPackages || [], modulePath)
+  };
+  const files = createEnterprisePackageFiles(officialExporter, officialBuild);
+  for (const [name, content] of Object.entries(files)) {
+    if (!name.startsWith("company/ext/") && !name.startsWith("custom/")) continue;
+    const target = path.join(sourceRoot, name);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, Buffer.isBuffer(content) ? content : String(content ?? ""), Buffer.isBuffer(content) ? undefined : "utf8");
+  }
+  if (clean(exporter.name || exporter.id) === "node_exporter") {
+    const hookPath = path.join(sourceRoot, "collector", "company_ext.go");
+    fs.writeFileSync(hookPath, renderNodeExporterCompanyExtHook(modulePath), "utf8");
+    return { ok: true, source: "official-source", hook: "collector/company_ext.go" };
+  }
+  return {
+    ok: (build.selectedPackages || []).length === 0,
+    source: "official-source",
+    reason: `official source hook is not implemented for ${exporter.name || exporter.id}`
+  };
+}
+
+function withModulePathForPackages(packages, modulePath) {
+  return packages.map((pkg) => {
+    const sourcePath = clean(pkg.sourcePath || pkg.source || `custom/capabilities/${pkg.packageId || pkg.id}/capability.go`);
+    const importPath = `${modulePath}/${sourcePath.replace(/\\/g, "/").replace(/\/[^/]+\.go$/, "")}`;
+    return {
+      ...pkg,
+      sourcePath,
+      import_path: importPath,
+      files: Array.isArray(pkg.files) && pkg.files.length ? pkg.files : [sourcePath]
+    };
+  });
+}
+
+function renderNodeExporterCompanyExtHook(modulePath) {
+  return `package collector
+
+import (
+    "log/slog"
+    "sort"
+
+    "github.com/prometheus/client_golang/prometheus"
+
+    companyext "${modulePath}/company/ext"
+    _ "${modulePath}/custom/all"
+)
+
+func init() {
+    for _, definition := range companyext.RegisteredCollectors() {
+        definition := definition
+        registerCollector(definition.Name, definition.DefaultEnabled, func(logger *slog.Logger) (Collector, error) {
+            fn, err := definition.Factory()
+            if err != nil {
+                return nil, err
+            }
+            return customExtCollector{name: definition.Name, collect: fn}, nil
+        })
+    }
+    companyext.RegisterCompanyExt()
+}
+
+type customExtCollector struct {
+    name string
+    collect companyext.MetricCollectorFunc
+}
+
+func (c customExtCollector) Update(ch chan<- prometheus.Metric) error {
+    metrics, err := c.collect()
+    if err != nil {
+        return err
+    }
+    for _, metric := range metrics {
+        labels := make([]string, 0, len(metric.Labels))
+        for label := range metric.Labels {
+            labels = append(labels, label)
+        }
+        sort.Strings(labels)
+        values := make([]string, 0, len(labels))
+        for _, label := range labels {
+            values = append(values, metric.Labels[label])
+        }
+        valueType := prometheus.GaugeValue
+        if metric.Type == "counter" {
+            valueType = prometheus.CounterValue
+        }
+        help := metric.Help
+        if help == "" {
+            help = "Custom metric from company/ext capability package."
+        }
+        ch <- prometheus.MustNewConstMetric(
+            prometheus.NewDesc(metric.Name, help, labels, nil),
+            valueType,
+            metric.Value,
+            values...,
+        )
+    }
+    return nil
+}
+`;
 }
 
 function compileGoExecutable(buildRoot, build) {
@@ -1222,7 +1436,10 @@ function createEnterprisePackageFiles(exporter, build) {
     ].join("\n"),
     "build.log": renderBuildLog(build)
   };
-  Object.assign(files, renderCapabilitySourceFiles(build));
+  if (clean(exporter.name || exporter.id) === "node_exporter") {
+    files["official-hooks/node_exporter/collector/company_ext.go.txt"] = renderNodeExporterCompanyExtHook("github.com/prometheus/node_exporter");
+  }
+  Object.assign(files, renderCapabilitySourceFiles(build, exporter));
   if (build.officialAsset?.available || build.officialRuntimeBinary?.available) {
     const asset = build.officialAsset || build.officialRuntimeBinary;
     const assetPath = resolveBuildFile(path.join(".elmp", "builds", sanitizeFileName(build.id), asset.packagePath));
@@ -1499,19 +1716,40 @@ func RegisteredCapabilities() []CapabilityInfo {
     return out
 }
 
-type CollectorFactory interface{}
+type Metric struct {
+    Name string
+    Type string
+    Help string
+    Labels map[string]string
+    Value float64
+}
+
+type MetricCollectorFunc func() ([]Metric, error)
+
+type CollectorDefinition struct {
+    Name string
+    DefaultEnabled bool
+    Factory func() (MetricCollectorFunc, error)
+}
+
+type CollectorFactory = CollectorDefinition
 type ScraperFactory interface{}
 type SecurityMiddlewareFactory interface{}
 type CredentialProviderFactory interface{}
 
 var (
-    collectorRegistry           []CollectorFactory
+    collectorRegistry           []CollectorDefinition
     scraperRegistry             []ScraperFactory
     securityMiddlewareRegistry []SecurityMiddlewareFactory
     credentialProviderRegistry []CredentialProviderFactory
 )
 
-func RegisterCollector(factory CollectorFactory) { collectorRegistry = append(collectorRegistry, factory) }
+func RegisterCollector(factory CollectorDefinition) { collectorRegistry = append(collectorRegistry, factory) }
+func RegisteredCollectors() []CollectorDefinition {
+    out := make([]CollectorDefinition, len(collectorRegistry))
+    copy(out, collectorRegistry)
+    return out
+}
 func RegisterScraper(factory ScraperFactory) { scraperRegistry = append(scraperRegistry, factory) }
 func RegisterSecurityMiddleware(factory SecurityMiddlewareFactory) {
     securityMiddlewareRegistry = append(securityMiddlewareRegistry, factory)
@@ -1532,12 +1770,12 @@ func ${symbol}() {
 `;
 }
 
-function renderCapabilitySourceFiles(build) {
+function renderCapabilitySourceFiles(build, exporter = {}) {
   const files = {};
   for (const pkg of build.selectedPackages || []) {
     const sourcePath = clean(pkg.sourcePath || `custom/capabilities/${pkg.packageId}/capability.go`);
     const extensionPoint = getExtensionPoint(pkg.kind || pkg.type);
-    const content = renderGeneratedSource({ collectorRegistryHook: { symbol: "RegisterCompanyExt" } }, extensionPoint, {
+    const content = renderGeneratedSource({ ...exporter, collectorRegistryHook: { symbol: "RegisterCompanyExt" } }, extensionPoint, {
       ...pkg,
       id: pkg.packageId || pkg.id,
       name: pkg.name || pkg.packageId || pkg.id,
@@ -1567,6 +1805,7 @@ function renderBuildLog(build) {
     `[exporter-builder] generate Go source package`,
     `[exporter-builder] verify ${build.verification?.command || build.verification?.mode || "static-go-source-check"}`,
     build.verification?.ok ? "[exporter-builder] verification passed" : `[exporter-builder] verification ${build.verification ? "failed" : "not-run"}`,
+    `[exporter-builder] binary source ${build.compiledBinary?.source || "generated-assembly"}`,
     `[exporter-builder] package ${build.packageFileName || `${sanitizeFileName(build.version)}.tar.gz`}`,
     `[exporter-builder] artifact ${build.artifactKind || "go-source-assembly"} ${build.artifact}`,
     build.status === "failed" ? "[exporter-builder] failed" : "[exporter-builder] success"
@@ -2369,6 +2608,11 @@ function createCustomLock(exporter, packages, version) {
 }
 
 function createBuildConfig(exporter, packages, input = {}) {
+  const target = normalizeBuildTarget({
+    os: input.targetOs || input.goos || input.os || input.target?.os,
+    arch: input.targetArch || input.goarch || input.arch || input.target?.arch,
+    arm: input.targetArm || input.goarm || input.arm || input.target?.arm
+  });
   return {
     path: clean(input.buildConfigPath || "build/exporter-builder.yaml"),
     builder: "exporter-builder",
@@ -2381,20 +2625,24 @@ function createBuildConfig(exporter, packages, input = {}) {
     generatedAssembly: "custom/all/all_gen.go",
     generatedRegistry: "company/ext/capabilities_gen.go",
     buildInfo: "dist/build-info.json",
+    target,
     packageCount: packages.length
   };
 }
 
 function renderAssemblySource(build) {
   const packages = build.selectedPackages || [];
+  const imports = packages.length
+    ? `
+import (
+${packages.map((pkg) => `    _ "${pkg.import_path || `example.com/exporter/custom/capabilities/${pkg.packageId}`}"`).join("\n")}
+)`
+    : "";
   return `package all
 
 // Code generated by exporter-builder. DO NOT EDIT.
 // Build: ${build.version}
-
-import (
-${packages.map((pkg) => `    _ "${pkg.import_path || `example.com/exporter/custom/capabilities/${pkg.packageId}`}"`).join("\n")}
-)
+${imports}
 `;
 }
 
@@ -2449,6 +2697,37 @@ function createTarGz(files) {
   });
   chunks.push(Buffer.alloc(1024));
   return zlib.gzipSync(Buffer.concat(chunks));
+}
+
+function extractTarGzStripRoot(archivePath, outputDir) {
+  fs.rmSync(outputDir, { recursive: true, force: true });
+  fs.mkdirSync(outputDir, { recursive: true });
+  const outputRoot = path.resolve(outputDir);
+  const body = zlib.gunzipSync(fs.readFileSync(archivePath));
+  for (let offset = 0; offset + 512 <= body.length;) {
+    const rawName = body.subarray(offset, offset + 100).toString("utf8").replace(/\0.*$/, "");
+    if (!rawName) break;
+    const sizeText = body.subarray(offset + 124, offset + 136).toString("ascii").replace(/\0.*$/, "").trim();
+    const size = parseInt(sizeText || "0", 8);
+    const type = String.fromCharCode(body[offset + 156] || 48);
+    const dataOffset = offset + 512;
+    offset += 512 + Math.ceil(size / 512) * 512;
+
+    if (!rawName || rawName === "pax_global_header") continue;
+    const rel = rawName.split("/").slice(1).join("/");
+    if (!rel) continue;
+    const target = path.resolve(outputRoot, rel);
+    if (!(target === outputRoot || target.startsWith(`${outputRoot}${path.sep}`))) {
+      throw new Error(`unsafe tar entry: ${rawName}`);
+    }
+    if (type === "5" || rawName.endsWith("/")) {
+      fs.mkdirSync(target, { recursive: true });
+      continue;
+    }
+    if (type !== "0" && type !== "\0") continue;
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, body.subarray(dataOffset, dataOffset + size));
+  }
 }
 
 function createTarHeader(name, size) {
@@ -2691,6 +2970,7 @@ function renderGeneratedSource(exporter, extensionPoint, item) {
   const provides = item.provides || [`${kind}:${item.id || item.name}`];
   const requires = item.requires || [];
   const metrics = item.metrics || [];
+  const entry = item.entry || "NewCapability";
   return `package ${packageName}
 
 // Code generated by Exporter Studio.
@@ -2726,13 +3006,20 @@ type ConfigProfile struct {
 
 var _ = ext.CapabilityInfo{}
 
-${renderCapabilityFunction(kind, item.entry, item.editableCode)}
+${renderCollectorRegistration(kind, item, entry)}
+
+${renderCapabilityFunction(kind, entry, item.editableCode)}
 `;
 }
 
 function renderCapabilityFunction(kind, entry, editableCode) {
   const name = entry || "NewCapability";
   const body = indentCode(editableCode || "return nil, nil", "    ");
+  if (["collector", "metric", "scraper"].includes(kind)) {
+    return `func ${name}() ([]Metric, error) {
+${body}
+}`;
+  }
   const prelude = kind === "transform"
     ? "    metrics := []Metric{}\n"
     : kind === "security"
@@ -2741,6 +3028,41 @@ function renderCapabilityFunction(kind, entry, editableCode) {
   return `func ${name}() (interface{}, error) {
 ${prelude}${prelude ? "" : ""}
 ${body}
+}`;
+}
+
+function renderCollectorRegistration(kind, item, entry) {
+  if (!["collector", "metric", "scraper"].includes(kind)) return "";
+  const collectorName = goCollectorName(item.packageId || item.id || item.name);
+  const defaultEnabled = item.default_enabled || item.defaultEnabled ? "true" : "false";
+  return `func init() {
+    ext.RegisterCollector(ext.CollectorDefinition{
+        Name: "${collectorName}",
+        DefaultEnabled: ${defaultEnabled},
+        Factory: func() (ext.MetricCollectorFunc, error) {
+            return func() ([]ext.Metric, error) {
+                metrics, err := ${entry}()
+                if err != nil {
+                    return nil, err
+                }
+                return toExtMetrics(metrics), nil
+            }, nil
+        },
+    })
+}
+
+func toExtMetrics(metrics []Metric) []ext.Metric {
+    out := make([]ext.Metric, 0, len(metrics))
+    for _, metric := range metrics {
+        out = append(out, ext.Metric{
+            Name: metric.Name,
+            Type: metric.Type,
+            Help: metric.Help,
+            Labels: metric.Labels,
+            Value: metric.Value,
+        })
+    }
+    return out
 }`;
 }
 
@@ -2820,6 +3142,13 @@ function goPackageName(value) {
     .replace(/[^a-z0-9_]+/g, "_")
     .replace(/^_+|_+$/g, "");
   return /^[a-z_]/.test(name) ? name : `pkg_${name || "capability"}`;
+}
+
+function goCollectorName(value) {
+  return String(value || "custom")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "") || "custom";
 }
 
 function normalizeCompatibleRange(compatible) {

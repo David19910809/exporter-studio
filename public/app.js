@@ -239,10 +239,12 @@ on("#buildExporterSelect", "change", async () => {
   await selectExporterVersion(value("#buildExporterSelect"), { silent: true });
   setView("delivery");
 });
-["#buildOfficialPackageSelect", "#buildVersion", "#buildOperator", "#buildNote", "#buildPatchNote", "#buildArgs"].forEach((selector) => {
+["#buildOfficialPackageSelect", "#buildVersion", "#buildOperator", "#buildNote", "#buildPatchNote", "#buildArgs", "#buildTargetOs", "#buildTargetArch", "#buildTargetArm"].forEach((selector) => {
   on(selector, "input", renderBuildAssemblyPreview);
   on(selector, "change", renderBuildAssemblyPreview);
 });
+on("#buildOfficialPackageSelect", "change", syncBuildTargetFromPackage);
+on("#buildTargetArch", "change", updateBuildTargetArmVisibility);
 on("#buildPackageChecklist", "change", renderBuildAssemblyPreview);
 
 on("#saveExporterBtn", "click", saveExporterMetadata);
@@ -395,6 +397,7 @@ async function createBuild() {
     appendBuildLog("info", `官方基线：${officialPkg ? `${officialPkg.version} / ${labelPackageSource(officialPkg.source)}` : "未选择官方版本包，使用当前 exporter 基线"}`);
     setBuildProgress(18, "确认官方基线");
     await delay(180);
+    appendBuildLog("info", `目标平台：${labelBuildTarget({ os: value("#buildTargetOs"), arch: value("#buildTargetArch"), arm: value("#buildTargetArm") })}`);
     appendBuildLog("info", `读取 custom/custom.yaml，选中能力包 ${selectedPackageIds.length} 个`);
     selectedPackages.forEach((pkg) => appendBuildLog("info", `能力包：${pkg.id} / ${pkg.kind || pkg.type} / ${pkg.version}`));
     setBuildProgress(34, "读取能力包清单");
@@ -414,6 +417,9 @@ async function createBuild() {
       officialPackageId: value("#buildOfficialPackageSelect"),
       selectedPackageIds,
       version: buildVersion,
+      targetOs: value("#buildTargetOs"),
+      targetArch: value("#buildTargetArch"),
+      targetArm: value("#buildTargetArm"),
       operator: value("#buildOperator"),
       note: value("#buildNote"),
       patchNote: value("#buildPatchNote"),
@@ -637,6 +643,8 @@ function renderBuildWizard(data) {
     <option value="${esc(pkg.id)}">${esc(pkg.version)} / ${esc(labelPackageSource(pkg.source))}${pkg.fileName ? ` / ${esc(pkg.fileName)}` : ""}</option>
   `).join("") : `<option value="">暂无可选官方版本包</option>`);
   setValue("#buildOfficialPackageSelect", exporter.officialPackageId || packages.find((pkg) => pkg.version === exporter.officialBaseline)?.id || packages[0]?.id || "");
+  renderBuildTargetOptions();
+  syncBuildTargetFromPackage({ preserveManual: true });
   if (!value("#buildVersion")) setValue("#buildVersion", `${exporter.localVersion}+custom.${(exporter.builds?.length || 0) + 1}`);
 
   const selectedIds = new Set((exporter.customItems || []).filter((item) => item.status === "enabled").map((item) => item.packageId || item.id));
@@ -653,6 +661,96 @@ function renderBuildWizard(data) {
   renderBuildAssemblyPreview();
 }
 
+function renderBuildTargetOptions() {
+  html("#buildTargetOs", [
+    ["linux", "Linux"],
+    ["windows", "Windows"],
+    ["darwin", "macOS / Darwin"],
+    ["freebsd", "FreeBSD"],
+    ["openbsd", "OpenBSD"],
+    ["netbsd", "NetBSD"],
+    ["aix", "AIX"],
+    ["solaris", "Solaris"]
+  ].map(([id, label]) => `<option value="${id}">${label}</option>`).join(""));
+  html("#buildTargetArch", [
+    ["amd64", "amd64 / x86_64"],
+    ["arm64", "arm64 / ARM 64"],
+    ["arm", "arm / ARM 32"],
+    ["386", "386 / x86"],
+    ["s390x", "s390x"],
+    ["riscv64", "riscv64"],
+    ["ppc64le", "ppc64le"],
+    ["ppc64", "ppc64"],
+    ["mips64le", "mips64le"],
+    ["mips64", "mips64"],
+    ["mipsle", "mipsle"],
+    ["mips", "mips"]
+  ].map(([id, label]) => `<option value="${id}">${label}</option>`).join(""));
+  html("#buildTargetArm", [
+    ["", "自动"],
+    ["7", "ARMv7"],
+    ["6", "ARMv6"],
+    ["5", "ARMv5"]
+  ].map(([id, label]) => `<option value="${id}">${label}</option>`).join(""));
+}
+
+function syncBuildTargetFromPackage(options = {}) {
+  const officialPkg = findPackageById(value("#buildOfficialPackageSelect"));
+  const target = inferBuildTarget(officialPkg, dashboard?.exporter);
+  if (!options.preserveManual || !value("#buildTargetOs")) setValue("#buildTargetOs", target.os);
+  if (!options.preserveManual || !value("#buildTargetArch")) setValue("#buildTargetArch", target.arch);
+  if (!options.preserveManual || !value("#buildTargetArm")) setValue("#buildTargetArm", target.arm || "");
+  updateBuildTargetArmVisibility();
+  renderBuildAssemblyPreview();
+}
+
+function updateBuildTargetArmVisibility() {
+  const isArm = value("#buildTargetArch") === "arm";
+  const label = qs("#buildTargetArmLabel");
+  if (label) label.classList.toggle("hidden", !isArm);
+  if (!isArm) setValue("#buildTargetArm", "");
+}
+
+function inferBuildTarget(pkg, exporter = {}) {
+  const inferred = inferPackageTarget(pkg);
+  if (inferred.os && inferred.arch) return inferred;
+  const exporterName = String(exporter?.name || exporter?.id || "").toLowerCase();
+  if (exporterName.includes("windows_exporter")) return { os: "windows", arch: "amd64", arm: "" };
+  return { os: "linux", arch: "amd64", arm: "" };
+}
+
+function inferPackageTarget(pkg = {}) {
+  const fileName = String(pkg.fileName || "").toLowerCase();
+  const rawOs = String(pkg.os || "").toLowerCase();
+  const rawArch = String(pkg.arch || "").toLowerCase();
+  const os = ["linux", "windows", "darwin", "freebsd", "openbsd", "netbsd", "aix", "solaris"].includes(rawOs)
+    ? rawOs
+    : fileName.includes("windows") || fileName.endsWith(".exe") || fileName.endsWith(".msi") ? "windows"
+      : fileName.includes("linux") ? "linux"
+        : fileName.includes("darwin") || fileName.includes("macos") ? "darwin"
+          : fileName.includes("freebsd") ? "freebsd"
+            : fileName.includes("openbsd") ? "openbsd"
+              : fileName.includes("netbsd") ? "netbsd"
+                : fileName.includes("aix") ? "aix"
+                  : fileName.includes("solaris") ? "solaris"
+                    : "";
+  const archSource = rawArch && rawArch !== "unknown" && rawArch !== "source" ? rawArch : fileName;
+  const arm = /armv([567])/.exec(archSource)?.[1] || "";
+  const arch = archSource.includes("arm64") || archSource.includes("aarch64") ? "arm64"
+    : archSource.includes("amd64") || archSource.includes("x86_64") ? "amd64"
+      : archSource.includes("386") || archSource.includes("i386") ? "386"
+        : archSource.includes("s390x") ? "s390x"
+          : archSource.includes("riscv64") ? "riscv64"
+            : archSource.includes("ppc64le") ? "ppc64le"
+              : archSource.includes("ppc64") ? "ppc64"
+                : archSource.includes("mips64le") ? "mips64le"
+                  : archSource.includes("mips64") ? "mips64"
+                    : archSource.includes("mipsle") ? "mipsle"
+                      : archSource.includes("mips") ? "mips"
+                        : arm ? "arm" : "";
+  return { os, arch, arm };
+}
+
 function renderBuildAssemblyPreview() {
   if (!dashboard) return;
   const exporter = dashboard.exporter;
@@ -666,6 +764,7 @@ function renderBuildAssemblyPreview() {
   const rows = [
     ["企业版本", `${exporter.name} / ${value("#buildVersion") || "自动生成"}`],
     ["官方基线包", officialPkg ? `${officialPkg.version} / ${labelPackageSource(officialPkg.source)}` : exporter.officialBaseline],
+    ["目标平台", labelBuildTarget({ os: value("#buildTargetOs"), arch: value("#buildTargetArch"), arm: value("#buildTargetArm") })],
     ["稳定扩展接口", exporter.companyExt?.path || "company/ext"],
     ["装配清单", "custom/custom.yaml"],
     ["锁定文件", "custom/custom.lock.yaml"],
@@ -1322,7 +1421,8 @@ function labelArtifactKind(kind) {
 function labelBuildTarget(target) {
   if (!target) return "-";
   if (typeof target === "string") return target;
-  return target.label || [target.os, target.arch].filter(Boolean).join("/") || "-";
+  const suffix = target.arch === "arm" && target.arm ? `v${target.arm}` : "";
+  return target.label || [target.os, `${target.arch || ""}${suffix}`].filter(Boolean).join("/") || "-";
 }
 
 function labelValidation(status) {

@@ -330,6 +330,9 @@
                       <label>官方版本包<select id="buildOfficialPackageSelect"></select><small class="field-note">构建只能从已同步或已上传的官方版本包中选择。</small></label>
                       <label>发布版本号<input id="buildVersion" placeholder="不填则自动生成"><small class="field-note">建议使用自动生成；手填时应包含 exporter 名称、企业标识和递增号。</small></label>
                       <label>操作人<input id="buildOperator" value="平台团队"><small class="field-note">用于构建审计和发布记录追踪。</small></label>
+                      <label>目标系统<select id="buildTargetOs"></select><small class="field-note">默认按官方包推断；也可手动指定 linux 或 windows。</small></label>
+                      <label>芯片架构<select id="buildTargetArch"></select><small class="field-note">amd64 对应常见 x86_64；arm64 对应鲲鹏、飞腾等 ARM 64 位。</small></label>
+                      <label id="buildTargetArmLabel">ARM 版本<select id="buildTargetArm"></select><small class="field-note">仅 GOARCH=arm 时需要，常用 v7。</small></label>
                       <label class="span-2">构建标签<input id="buildTags" placeholder="例如：认证, Windows, 回归验证"><small class="field-note">多个标签可用逗号、空格或顿号分隔，用于构建记录搜索。</small></label>
                     </div>
                   </div>
