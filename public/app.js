@@ -180,7 +180,7 @@ on("#buildBtn2", "click", createBuild);
 on("#closeBuildPreviewBtn", "click", closeBuildPreview);
 on("#buildSearchInput", "input", () => {
   buildSearchQuery = value("#buildSearchInput").toLowerCase();
-  renderBuilds(dashboard?.exporter);
+  renderBuilds(dashboard?.exporters || []);
 });
 on("#openVersionModalBtn", "click", () => openVersionModal());
 on("#closeVersionModalBtn", "click", closeVersionModal);
@@ -262,7 +262,7 @@ async function refresh() {
   renderExtensionPoints(dashboard.extensionPoints || []);
   renderCapabilityPackages(dashboard.capabilityPackages || []);
   renderBuildWizard(dashboard);
-  renderBuilds(exporter);
+  renderBuilds(dashboard.exporters || []);
   renderActivity(dashboard.activity || []);
   fillForms(exporter || createExporterDraft());
 }
@@ -426,13 +426,13 @@ async function createBuild() {
     appendBuildLog("success", `构建完成：${build.version}`);
     appendBuildLog("success", `产物：${build.artifact}`);
     if (build.verification?.ok) {
-      appendBuildLog("success", `可用性验证通过：${build.verification.endpoint}，指标 ${build.verification.metricCount} 个`);
+      appendBuildLog("success", `源码装配验证通过：${build.verification.mode || build.verification.command || "static-go-source-check"}`);
     } else if (build.verification) {
-      appendBuildLog("error", `可用性验证失败：${build.verification.message || "未知错误"}`);
+      appendBuildLog("error", `源码装配验证失败：${build.verification.message || "未知错误"}`);
     }
-    appendBuildLog("info", `运行入口：${build.runtimeEntrypoint || "bin/exporter-runtime.js"}`);
+    appendBuildLog("info", `产物类型：${labelArtifactKind(build.artifactKind)}`);
     appendBuildLog("info", `下载包：${build.packageFileName || `${build.version}.tar.gz`}`);
-    appendBuildLog("info", "可在构建发布记录中下载企业包、custom.yaml、lock、build-info 和装配代码");
+    appendBuildLog("info", "可在构建发布记录中下载 Go 源码装配包、custom.yaml、lock、build-info 和装配代码");
     await refresh();
     closeBuildModal();
     setView("delivery");
@@ -549,7 +549,7 @@ function renderCatalog(catalog) {
     <div class="row catalog-row">
       <div>
         <strong>${esc(item.name)} <span class="muted">/ ${esc(item.category)}</span></strong>
-        <span class="catalog-meta">${esc(formatDate(item.latestPublishedAt))} / ${esc(labelSummarySource(item.summarySource))} / 版本包 ${(item.packages || []).length} 个</span>
+        <span class="catalog-meta">${esc(formatDate(item.latestPublishedAt))} / ${esc(labelSummarySource(item.summarySource))} / release 资产 ${esc(item.assetCount ?? (item.packages || []).filter((pkg) => pkg.assetType !== "source-archive").length)} 个 / 可装配 ${esc(item.buildableAssetCount ?? (item.packages || []).filter((pkg) => pkg.availableForBuild).length)} 个</span>
         <small>${esc(item.updateSummary)}</small>
         ${renderPackagePreview(item.packages || [], item)}
       </div>
@@ -565,9 +565,9 @@ function renderPackagePreview(packages, catalogItem = {}) {
   if (!packages.length) return "";
   return `
     <div class="package-list">
-      ${packages.slice(0, 3).map((pkg) => `
+      ${packages.slice(0, 5).map((pkg) => `
         <div class="package-option">
-          <span class="package-pill">${esc(pkg.version)} / ${esc(labelPackageSource(pkg.source))} / ${esc(formatDate(pkg.publishedAt))}${pkg.fileName ? ` / ${esc(pkg.fileName)}` : ""}</span>
+          <span class="package-pill">${esc(pkg.version)} / ${esc(labelPackageSource(pkg.source))} / ${esc(labelAssetType(pkg.assetType))}${pkg.os ? ` / ${esc(pkg.os)}` : ""}${pkg.arch ? ` / ${esc(pkg.arch)}` : ""}${pkg.fileName ? ` / ${esc(pkg.fileName)}` : ""}</span>
           <button class="secondary mini" data-build-from-package data-catalog-id="${esc(catalogItem.id || catalogItem.name || "")}" data-package-id="${esc(pkg.id)}">构建企业版</button>
         </div>
       `).join("")}
@@ -579,17 +579,6 @@ function renderCatalogUploadOptions(catalog) {
   html("#uploadCatalogId", catalog.map((item) => `
     <option value="${esc(item.id)}">${esc(item.name)} / ${esc(item.category)}</option>
   `).join(""));
-}
-
-function renderPackagePreview(packages) {
-  if (!packages.length) return "";
-  return `
-    <div class="package-list">
-      ${packages.slice(0, 3).map((pkg) => `
-        <span class="package-pill">${esc(pkg.version)} / ${esc(labelPackageSource(pkg.source))} / ${esc(formatDate(pkg.publishedAt))}${pkg.fileName ? ` / ${esc(pkg.fileName)}` : ""}</span>
-      `).join("")}
-    </div>
-  `;
 }
 
 function renderExtensionPoints(points) {
@@ -691,13 +680,14 @@ function renderBuildAssemblyPreview() {
   `);
 }
 
-function renderBuilds(exporter) {
-  if (!exporter) {
+function renderBuilds(exporters) {
+  const allBuilds = collectBuildRecords(exporters);
+  if (!Array.isArray(exporters) || !exporters.length) {
     html("#buildList", `<div class="empty">暂无构建记录。企业版本创建后可在这里构建并下载内部版本。</div>`);
     return;
   }
-  const builds = (exporter.builds || []).filter((build) => buildMatchesSearch(build));
-  if (!exporter.builds?.length) {
+  const builds = allBuilds.filter((build) => buildMatchesSearch(build));
+  if (!allBuilds.length) {
     html("#buildList", `<div class="empty">暂无构建记录。完成一次装配构建后可在这里下载产物。</div>`);
     return;
   }
@@ -707,18 +697,21 @@ function renderBuilds(exporter) {
         <strong>${esc(build.version)}</strong>
         <span>${esc(build.artifact)}</span>
         <div class="build-tags">${renderBuildTags(build)}</div>
+        <small>所属版本：${esc(build.exporterName || build.exporterId || "-")} / ${esc(build.enterpriseVersionId || "-")} / 企业版本 ${esc(build.enterpriseLocalVersion || "-")}</small>
         <small>官方基线：${esc(build.baseline || "")} / ${esc(labelPackageSource(build.officialPackageSource))}${build.officialPackageFileName ? ` / ${esc(build.officialPackageFileName)}` : ""}</small>
         <small>company/ext：${esc(build.companyExtPath || "")} / custom：${esc((build.customItemNames || []).join("、") || `${build.customCount || 0} 个`)}</small>
         <small>构建参数：${esc(build.manualConfig?.args || "-")} / 操作人：${esc(build.manualConfig?.operator || "-")}</small>
         ${build.assemblyValidation ? `<small>装配验证：${build.assemblyValidation.ok ? "通过" : "失败"} / ${esc(build.assemblyValidation.packageCount || 0)} 个能力包 / 覆盖 ${esc(countCoveredKinds(build.assemblyValidation.kindCoverage))} 类</small>` : ""}
-        ${build.verification ? `<small>可用性验证：${build.verification.ok ? "通过" : "失败"} / ${esc(build.verification.endpoint || "/metrics")} / 指标 ${esc(build.verification.metricCount || 0)} 个</small>` : ""}
-        ${build.packageFileName ? `<small>运行入口：${esc(build.runtimeEntrypoint || "")} / 下载包：${esc(build.packageFileName)}</small>` : ""}
+        ${build.verification ? `<small>源码验证：${build.verification.ok ? "通过" : "失败"} / ${esc(build.verification.mode || build.verification.command || "static-go-source-check")} / ${esc(build.verification.message || "")}</small>` : ""}
+        ${build.packageFileName ? `<small>产物类型：${esc(labelArtifactKind(build.artifactKind))} / 目标平台：${esc(labelBuildTarget(build.target || build.compiledBinary?.target))} / 下载包：${esc(build.packageFileName)}</small>` : ""}
+        ${build.compiledBinary?.ok ? `<small>二进制：${esc(build.compiledBinary.fileName || build.runtimeEntrypoint || "")}</small>` : ""}
         <div class="build-tag-editor">
           <input data-build-tags-input="${esc(build.id)}" value="${esc((build.tags || []).join("，"))}" placeholder="标签：认证，回归，Windows">
           <button class="secondary mini" data-save-build-tags data-build-id="${esc(build.id)}">保存标签</button>
         </div>
         <div class="download-list">
           <button class="primary-download mini" data-download-build data-build-id="${esc(build.id)}" data-file="package">下载企业包</button>
+          ${build.compiledBinary?.ok ? `<button class="primary-download mini" data-download-build data-build-id="${esc(build.id)}" data-file="binary">下载二进制</button>` : ""}
           ${["artifact", "exporter", "custom", "lock", "build-info", "assembly-validation", "assembly", "registry", "log"].map((file) => `
             <button class="secondary mini" data-preview-build data-build-id="${esc(build.id)}" data-file="${esc(file)}">${esc(labelPreview(file))}</button>
           `).join("")}
@@ -728,6 +721,18 @@ function renderBuilds(exporter) {
       <span class="badge status-${esc(build.status === "failed" ? "failed" : "success")}">${esc(labelBuild(build.status))}</span>
     </div>
   `).join("") : `<div class="empty">没有匹配的构建记录。可以换个版本号、标签或能力包关键词搜索。</div>`);
+}
+
+function collectBuildRecords(exporters) {
+  return (exporters || [])
+    .flatMap((exporter) => (exporter.builds || []).map((build) => ({
+      ...build,
+      exporterId: exporter.id,
+      exporterName: exporter.name,
+      enterpriseVersionId: exporter.id,
+      enterpriseLocalVersion: exporter.localVersion
+    })))
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
 }
 
 function buildMatchesSearch(build) {
@@ -743,6 +748,10 @@ function buildSearchText(build) {
     labelBuild(build.status),
     build.baseline,
     build.artifact,
+    build.exporterId,
+    build.exporterName,
+    build.enterpriseVersionId,
+    build.enterpriseLocalVersion,
     build.companyBranch,
     build.manualConfig?.operator,
     build.manualConfig?.note,
@@ -1292,6 +1301,30 @@ function labelPackageSource(source) {
   return { "github-release": "GitHub Release", "manual-upload": "手动上传" }[source] || source || "版本包";
 }
 
+function labelAssetType(type) {
+  return {
+    binary: "二进制资产",
+    archive: "归档资产",
+    "source-archive": "源码包",
+    metadata: "校验文件",
+    asset: "资产"
+  }[type] || type || "资产";
+}
+
+function labelArtifactKind(kind) {
+  return {
+    "go-source-assembly": "Go 源码装配包",
+    "go-source-assembly-with-official-asset": "Go 源码装配包 + 官方资产",
+    "local-runnable-exporter": "本地模拟运行包"
+  }[kind] || kind || "构建产物";
+}
+
+function labelBuildTarget(target) {
+  if (!target) return "-";
+  if (typeof target === "string") return target;
+  return target.label || [target.os, target.arch].filter(Boolean).join("/") || "-";
+}
+
 function labelValidation(status) {
   return { passed: "校验通过", failed: "校验失败", pending: "待校验", active: "可用", unknown: "未知" }[status] || status || "未知";
 }
@@ -1299,6 +1332,7 @@ function labelValidation(status) {
 function labelDownload(file) {
   return {
     package: "下载企业包",
+    binary: "下载二进制",
     artifact: "产物说明",
     exporter: ".exporter.yaml",
     custom: "custom.yaml",
@@ -1313,6 +1347,7 @@ function labelDownload(file) {
 
 function labelPreview(file) {
   return {
+    binary: "二进制执行文件",
     artifact: "产物说明",
     exporter: ".exporter.yaml",
     custom: "custom.yaml",

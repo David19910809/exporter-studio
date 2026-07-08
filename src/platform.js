@@ -8,6 +8,7 @@ const { summarizeWithHunyuan } = require("./hunyuan");
 
 const UPLOAD_DIR = path.resolve(process.cwd(), ".elmp", "uploads");
 const BUILD_DIR = path.join(DATA_DIR, "builds");
+const GITHUB_API_BASE_URL = cleanEnv(process.env.GITHUB_API_BASE_URL || "https://api.github.com").replace(/\/+$/, "");
 
 const CAPABILITY_KINDS = [
   "collector",
@@ -225,7 +226,7 @@ function saveExporter(input = {}) {
   exporter.contactInfo = clean(input.contactInfo || exporter.contactInfo || "");
   exporter.localBranch = normalizeCmgBranch(input.localBranch || exporter.localBranch, exporterName);
   exporter.companyBranch = normalizeCmgBranch(input.companyBranch || input.localBranch || exporter.companyBranch || exporter.localBranch, exporterName);
-  exporter.localVersion = clean(input.localVersion || `${exporterName}-internal-1.0.0`);
+  exporter.localVersion = normalizeLocalVersion(input.localVersion || exporter.localVersion, exporterName);
   exporter.customDir = clean(input.customDir || exporter.customDir || "custom");
   exporter.exporterConfig = normalizeExporterConfig(exporter);
   exporter.companyExt = normalizeCompanyExt(exporter);
@@ -341,6 +342,7 @@ function addCustomItem(input = {}) {
     validation: validateEditableCode(extensionPoint, editableCode)
   };
   Object.assign(abilityPackage, createCapabilityInfo(abilityPackage, exporter));
+  abilityPackage.generatedCode = renderGeneratedSource(exporter, extensionPoint, abilityPackage);
   state.capabilityPackages = upsertCapabilityPackage(state.capabilityPackages, abilityPackage);
 
   const item = {
@@ -416,6 +418,7 @@ function saveCapabilityPackage(input = {}) {
     updatedAt: new Date().toISOString()
   };
   Object.assign(pkg, createCapabilityInfo(pkg, getCurrentExporter(state)));
+  pkg.generatedCode = renderGeneratedSource(getCurrentExporter(state), extensionPoint, pkg);
   state.capabilityPackages = upsertCapabilityPackage(state.capabilityPackages, pkg);
   addActivity(state, "能力包已保存", `${pkg.name} 已作为可复用资产保存。`);
   saveState(state);
@@ -482,11 +485,16 @@ function createBuild(input = {}) {
   const selectedPackages = enabledCustom.map((item) => resolveSelectedPackage(state, item));
   const assemblyValidation = validateCapabilityAssembly(exporter, selectedPackages);
   const sequence = exporter.builds.length + 1;
-  const version = clean(input.version) || `${exporter.localVersion}+custom.${sequence}`;
+  exporter.localVersion = normalizeLocalVersion(exporter.localVersion, exporter.name || exporter.id);
+  const requestedVersion = clean(input.version);
+  const version = requestedVersion && requestedVersion.startsWith(`${exporter.name}-`)
+    ? requestedVersion
+    : `${exporter.localVersion}+custom.${sequence}`;
   const lockFile = createCustomLock(exporter, selectedPackages, version);
   const buildConfig = createBuildConfig(exporter, selectedPackages, input);
   const build = {
     id: `build-${Date.now()}`,
+    exporterName: exporter.name,
     version,
     sourceBranch: exporter.localBranch,
     upstream: `${exporter.upstreamRemote || "upstream"}/${exporter.officialBranch}`,
@@ -495,6 +503,8 @@ function createBuild(input = {}) {
     officialPackageId: exporter.officialPackageId || "",
     officialPackageSource: exporter.officialPackageSource || "",
     officialPackageFileName: exporter.officialPackageFileName || "",
+    officialPackage: selectedPackage || null,
+    target: resolveBuildTarget(exporter, selectedPackage),
     customCount: selectedPackages.length,
     customItemIds: selectedPackages.map((item) => item.selectionId || item.id),
     customItemNames: selectedPackages.map((item) => item.name),
@@ -525,9 +535,13 @@ function createBuild(input = {}) {
       exporter: exporter.id,
       version,
       baseline: exporter.officialBaseline,
+      target: resolveBuildTarget(exporter, selectedPackage),
       packageCount: selectedPackages.length,
       assemblyValidation,
       generatedFiles: [
+        "go.mod",
+        "company/ext/capability.go",
+        "company/ext/registry.go",
         "custom/all/all_gen.go",
         "company/ext/capabilities_gen.go",
         "custom/custom.lock.yaml",
@@ -745,10 +759,18 @@ function deleteInstance(id) {
 
 function getBuildDownload(buildId, file) {
   const state = loadState();
-  const exporter = getCurrentExporter(state);
-  const build = exporter.builds.find((item) => item.id === buildId) || exporter.builds[0];
+  const found = findBuildRecord(state, buildId);
+  const exporter = found?.exporter || getCurrentExporter(state);
+  const build = found?.build || exporter.builds[0];
   if (!build) throw new Error("构建记录不存在");
   const key = clean(file || "artifact");
+  if (key === "binary") {
+    return {
+      fileName: build.compiledBinary?.fileName || `${sanitizeFileName(build.version) || "exporter-studio"}.exe`,
+      contentType: "application/octet-stream",
+      content: getCompiledBinaryContent(build)
+    };
+  }
   const payloads = {
     package: {
       fileName: `${sanitizeFileName(build.version) || "enterprise-exporter"}.tar.gz`,
@@ -812,6 +834,15 @@ function getBuildDownload(buildId, file) {
   return result;
 }
 
+function findBuildRecord(state, buildId) {
+  const id = clean(buildId);
+  for (const exporter of state.exporters || []) {
+    const build = (exporter.builds || []).find((item) => item.id === id);
+    if (build) return { exporter, build };
+  }
+  return null;
+}
+
 function renderEnterprisePackage(exporter, build) {
   return createTarGz(createEnterprisePackageFiles(exporter, build));
 }
@@ -822,41 +853,50 @@ function getEnterprisePackageContent(exporter, build) {
   return renderEnterprisePackage(exporter, build);
 }
 
+function getCompiledBinaryContent(build) {
+  const binaryPath = resolveBuildFile(build.compiledBinary?.path || build.binaryPath);
+  if (binaryPath && fs.existsSync(binaryPath)) return fs.readFileSync(binaryPath);
+  throw new Error("该构建尚未生成可下载二进制，请重新构建。");
+}
+
 function buildRealExporterArtifact(exporter, build) {
   const buildRoot = path.join(BUILD_DIR, sanitizeFileName(build.id));
-  const runtimePath = path.join(buildRoot, "bin", "exporter-runtime.js");
   const packageFileName = `${sanitizeFileName(build.version) || "enterprise-exporter"}.tar.gz`;
   const packagePath = path.join(buildRoot, packageFileName);
-  const officialBinaryPlan = createOfficialBinaryPlan(exporter, build);
-  const officialBinary = prepareOfficialBinary(officialBinaryPlan, buildRoot);
-  build.officialRuntimeBinary = officialBinary;
-  const runtimeSource = renderExporterRuntimeSource(exporter, build);
+  const officialAsset = prepareOfficialAsset(build.officialPackage, buildRoot);
+  build.officialRuntimeBinary = officialAsset;
+  build.officialAsset = officialAsset;
+  build.artifactKind = officialAsset?.available ? "go-source-assembly-with-official-asset" : "go-source-assembly";
 
-  fs.mkdirSync(path.dirname(runtimePath), { recursive: true });
-  fs.writeFileSync(runtimePath, runtimeSource, "utf8");
+  const packageFiles = createEnterprisePackageFiles(exporter, build);
+  writeBuildDirectory(buildRoot, packageFiles);
 
-  const verification = verifyExporterRuntime(runtimePath);
+  const verification = verifyGoSourceAssembly(buildRoot);
+  const compiledBinary = compileGoExecutable(buildRoot, build);
   build.verification = verification;
-  build.status = verification.ok && (build.assemblyValidation?.ok ?? true) ? "success" : "failed";
-  build.artifactKind = "local-runnable-exporter";
-  build.runtimeEntrypoint = "bin/exporter-runtime.js";
+  build.compiledBinary = compiledBinary;
+  build.status = verification.ok && compiledBinary.ok && (build.assemblyValidation?.ok ?? true) ? "success" : "failed";
+  build.runtimeEntrypoint = compiledBinary.ok ? compiledBinary.packagePath : "README.md";
   build.packageFileName = packageFileName;
   build.packagePath = relativePath(packagePath);
-  build.binaryPath = relativePath(runtimePath);
+  build.binaryPath = compiledBinary.ok ? compiledBinary.path : "";
   build.downloadReady = build.status === "success";
   build.buildInfo = {
     ...(build.buildInfo || {}),
+    target: normalizeBuildTarget(build.target),
     artifactKind: build.artifactKind,
     artifactFileName: packageFileName,
     runtimeEntrypoint: build.runtimeEntrypoint,
-    officialRuntimeBinary: officialBinary,
+    officialRuntimeBinary: officialAsset,
+    officialAsset,
+    compiledBinary,
     assemblyValidation: build.assemblyValidation,
     verification
   };
 
+  writeBuildDirectory(buildRoot, createEnterprisePackageFiles(exporter, build));
   const packageBuffer = renderEnterprisePackage(exporter, build);
   fs.writeFileSync(packagePath, packageBuffer);
-  writeBuildDirectory(buildRoot, createEnterprisePackageFiles(exporter, build));
   return {
     verification,
     status: build.status,
@@ -865,6 +905,7 @@ function buildRealExporterArtifact(exporter, build) {
     packageFileName,
     packagePath: build.packagePath,
     binaryPath: build.binaryPath,
+    compiledBinary,
     downloadReady: build.downloadReady
   };
 }
@@ -875,6 +916,111 @@ function writeBuildDirectory(buildRoot, files) {
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, Buffer.isBuffer(content) ? content : String(content ?? ""), Buffer.isBuffer(content) ? undefined : "utf8");
   });
+}
+
+function resolveBuildTarget(exporter, officialPackage) {
+  const inferred = inferReleaseAsset(officialPackage?.fileName || "");
+  const rawOs = clean(officialPackage?.os || "");
+  const packageOs = isConcreteGoOS(rawOs) ? rawOs : inferred.os;
+  const packageArch = normalizeGoArch(officialPackage?.arch) || normalizeGoArch(inferred.arch);
+  const rawArch = normalizeGoArch(officialPackage?.arch) ? officialPackage?.arch : inferred.arch;
+  if (isConcreteGoOS(packageOs) && packageArch) {
+    const armVersion = normalizeGoArm(rawArch);
+    return {
+      os: packageOs,
+      arch: packageArch,
+      ...(armVersion ? { arm: armVersion } : {}),
+      source: "official-package",
+      label: `${packageOs}/${packageArch}${armVersion ? `v${armVersion}` : ""}`
+    };
+  }
+  const fallback = defaultBuildTarget(exporter);
+  return {
+    ...fallback,
+    source: rawOs === "source" || clean(officialPackage?.assetType) === "source-archive" ? "source-archive-default" : "exporter-default",
+    label: `${fallback.os}/${fallback.arch}`
+  };
+}
+
+function normalizeBuildTarget(target) {
+  const os = isConcreteGoOS(target?.os) ? clean(target.os) : "linux";
+  const arch = normalizeGoArch(target?.arch) || "amd64";
+  const armVersion = arch === "arm" ? normalizeGoArm(target?.arm || target?.arch) : "";
+  return {
+    os,
+    arch,
+    ...(armVersion ? { arm: armVersion } : {}),
+    source: clean(target?.source || "default"),
+    label: `${os}/${arch}${armVersion ? `v${armVersion}` : ""}`
+  };
+}
+
+function defaultBuildTarget(exporter = {}) {
+  const name = clean(exporter.name || exporter.id).toLowerCase();
+  if (name.includes("windows_exporter")) return { os: "windows", arch: "amd64" };
+  return { os: "linux", arch: "amd64" };
+}
+
+function isConcreteGoOS(value) {
+  return ["linux", "windows", "darwin", "freebsd", "openbsd", "netbsd", "aix", "solaris"].includes(clean(value));
+}
+
+function normalizeGoArch(value) {
+  const arch = clean(value).toLowerCase();
+  if (["amd64", "386", "arm64", "arm", "s390x", "riscv64", "ppc64le", "ppc64", "mips", "mipsle", "mips64", "mips64le"].includes(arch)) return arch;
+  if (arch === "x86_64") return "amd64";
+  if (arch === "aarch64") return "arm64";
+  if (arch.startsWith("armv")) return "arm";
+  return "";
+}
+
+function normalizeGoArm(value) {
+  const match = clean(value).toLowerCase().match(/^v?([567])$|armv([567])/);
+  return match ? (match[1] || match[2]) : "";
+}
+
+function compileGoExecutable(buildRoot, build) {
+  const target = normalizeBuildTarget(build.target);
+  const extension = target.os === "windows" ? ".exe" : "";
+  const fileName = `${sanitizeFileName(build.exporterName || build.exporter || "exporter")}-${sanitizeFileName(build.id || "build")}${extension}`;
+  const packagePath = `dist/${fileName}`;
+  const output = path.join(buildRoot, packagePath);
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  const env = {
+    ...process.env,
+    GOOS: target.os,
+    GOARCH: target.arch,
+    ...(target.arm ? { GOARM: target.arm } : {})
+  };
+  const result = spawnSync("go", ["build", "-o", output, "./cmd/exporter-studio"], {
+    cwd: buildRoot,
+    encoding: "utf8",
+    env,
+    timeout: 120000
+  });
+  if (result.status !== 0 || !fs.existsSync(output)) {
+    return {
+      ok: false,
+      command: `go build -o ${packagePath} ./cmd/exporter-studio`,
+      packagePath,
+      target,
+      message: "Go executable build failed",
+      stdout: clean(result.stdout || ""),
+      stderr: clean(result.stderr || result.error?.message || "")
+    };
+  }
+  const body = fs.readFileSync(output);
+  return {
+    ok: true,
+    command: `GOOS=${target.os} GOARCH=${target.arch} go build -o ${packagePath} ./cmd/exporter-studio`,
+    target,
+    packagePath,
+    path: relativePath(output),
+    fileName,
+    size: body.length,
+    sha256: crypto.createHash("sha256").update(body).digest("hex"),
+    message: "Go executable built successfully"
+  };
 }
 
 function createOfficialBinaryPlan(exporter, build) {
@@ -927,6 +1073,90 @@ function prepareOfficialBinary(plan, buildRoot) {
   };
 }
 
+function prepareOfficialAsset(pkg, buildRoot) {
+  if (!pkg) return null;
+  const fileName = sanitizeFileName(pkg.fileName || `${pkg.exporterName || pkg.exporterId || "exporter"}-${pkg.version || "official"}.tar.gz`);
+  if (!fileName) return null;
+  const targetPackagePath = `official/${fileName}`;
+  const target = path.join(buildRoot, targetPackagePath);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+
+  if (pkg.storagePath) {
+    const source = path.resolve(process.cwd(), pkg.storagePath);
+    if (fs.existsSync(source)) {
+      fs.copyFileSync(source, target);
+      return describeOfficialAsset(pkg, target, targetPackagePath, true);
+    }
+  }
+
+  if (pkg.downloadUrl && pkg.availableForBuild) {
+    const cacheDir = path.join(DATA_DIR, "official-assets", sanitizeFileName(pkg.exporterId || pkg.exporterName || "exporter"), sanitizeFileName(pkg.version || "unknown"));
+    const cached = path.join(cacheDir, fileName);
+    fs.mkdirSync(cacheDir, { recursive: true });
+    if (!fs.existsSync(cached)) {
+      const result = downloadFile(pkg.downloadUrl, cached);
+      if (!result.ok) {
+        return {
+          ...pickOfficialPackageFields(pkg),
+          available: false,
+          packagePath: targetPackagePath,
+          error: result.error
+        };
+      }
+    }
+    fs.copyFileSync(cached, target);
+    return describeOfficialAsset(pkg, target, targetPackagePath, true);
+  }
+
+  return {
+    ...pickOfficialPackageFields(pkg),
+    available: false,
+    packagePath: targetPackagePath,
+    error: "官方包没有可下载资产；请同步 GitHub release 资产或手动上传固定版本包。"
+  };
+}
+
+function downloadFile(url, target) {
+  const command = [
+    "$ProgressPreference = 'SilentlyContinue';",
+    `Invoke-WebRequest -Uri ${JSON.stringify(url)} -OutFile ${JSON.stringify(target)} -UseBasicParsing`
+  ].join(" ");
+  const result = spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], {
+    encoding: "utf8",
+    timeout: 180000
+  });
+  return {
+    ok: result.status === 0 && fs.existsSync(target),
+    error: clean(result.stderr || result.stdout || "download failed")
+  };
+}
+
+function describeOfficialAsset(pkg, target, packagePath, available) {
+  const body = fs.readFileSync(target);
+  return {
+    ...pickOfficialPackageFields(pkg),
+    available,
+    packagePath,
+    size: body.length,
+    sha256: crypto.createHash("sha256").update(body).digest("hex")
+  };
+}
+
+function pickOfficialPackageFields(pkg) {
+  return {
+    id: pkg.id || "",
+    exporter: pkg.exporterId || pkg.exporterName || "",
+    version: pkg.version || "",
+    source: pkg.source || "",
+    fileName: pkg.fileName || "",
+    assetType: pkg.assetType || "",
+    os: pkg.os || "",
+    arch: pkg.arch || "",
+    releaseUrl: pkg.releaseUrl || "",
+    downloadUrl: pkg.downloadUrl || ""
+  };
+}
+
 function createEnterprisePackageFiles(exporter, build) {
   const selectedPackages = build.selectedPackages || [];
   const manifest = exporter.customManifest || normalizeManifest(exporter);
@@ -934,36 +1164,49 @@ function createEnterprisePackageFiles(exporter, build) {
   const buildInfo = build.buildInfo || build;
   const files = {
     "README.txt": [
-      "Exporter Studio enterprise package",
+      "Exporter Studio Go source assembly package",
       `exporter=${exporter.id}`,
       `version=${build.version}`,
       `baseline=${build.baseline}`,
+      `target=${normalizeBuildTarget(build.target).label}`,
       `artifact=${build.artifact}`,
       `capabilities=${(build.customItemNames || []).join(", ") || "none"}`,
-      `runtime=${build.runtimeEntrypoint || "bin/exporter-runtime.js"}`,
+      `artifact_kind=${build.artifactKind || "go-source-assembly"}`,
+      `official_asset=${build.officialAsset?.available ? build.officialAsset.packagePath : "not bundled"}`,
       `verification=${build.verification?.ok ? "passed" : "not-run"}`,
       "",
-      "Run on Windows:",
-      "  bin\\run-windows.cmd",
+      "This package is not a simulated Node.js exporter runtime.",
+      "It contains generated Go source files for company/ext and custom capability assembly.",
       "",
-      "Run on Linux/macOS:",
-      "  node bin/exporter-runtime.js",
+      "Expected real build flow:",
+      "  1. Clone or unpack the official exporter source for the selected baseline.",
+      "  2. Copy company/ext and custom into the exporter source tree.",
+      "  3. Keep one stable upstream hook importing _ \"<module>/custom/all\".",
+      "  4. Run gofmt and go test ./... in the exporter source tree.",
+      "  5. Run the official exporter build command for the target OS/arch.",
       "",
-      "Metrics endpoint:",
-      "  http://127.0.0.1:9116/metrics",
+      "Generated files:",
+      "  go.mod",
+      "  company/ext/*.go",
+      "  custom/all/all_gen.go",
+      "  custom/capabilities/<package>/*.go",
+      "  custom/custom.yaml",
+      "  custom/custom.lock.yaml",
+      "  dist/build-info.json",
       "",
-      "Optional auth test:",
-      "  set EXPORTER_TESTAUTH_TOKEN=your-token",
-      "  curl -H \"testauth: your-token\" http://127.0.0.1:9116/metrics"
+      "Network policy:",
+      "  GitHub sync/download is performed by the server side. In intranet environments set GITHUB_API_BASE_URL to a GitHub proxy/mirror, or use manual upload for fixed official packages."
     ].join("\n"),
-    "bin/exporter-runtime.js": renderExporterRuntimeSource(exporter, build),
-    "bin/run-windows.cmd": renderWindowsRunScript(),
-    "bin/run-linux.sh": renderLinuxRunScript(),
+    "go.mod": renderGoMod(exporter),
+    "cmd/exporter-studio/main.go": renderAssemblyMainSource(exporter, build),
     ".exporter.yaml": toYaml(exporter.exporterConfig || normalizeExporterConfig(exporter)),
     "custom/custom.yaml": toYaml(manifest),
     "custom/custom.lock.yaml": toYaml(lockFile),
     "custom/all/all_gen.go": renderAssemblySource(build),
+    "company/ext/capability.go": renderCompanyExtCapabilitySource(),
+    "company/ext/registry.go": renderCompanyExtRegistrySource(exporter),
     "company/ext/capabilities_gen.go": renderCapabilitiesRegistrySource(build),
+    "build/exporter-builder.yaml": toYaml(build.buildConfig || createBuildConfig(exporter, selectedPackages, {})),
     "dist/build-info.json": JSON.stringify(buildInfo, null, 2),
     "dist/verification.json": JSON.stringify(build.verification || { ok: false, reason: "not-run" }, null, 2),
     "dist/assembly-validation.json": JSON.stringify(build.assemblyValidation || { ok: false, reason: "not-run" }, null, 2),
@@ -972,17 +1215,344 @@ function createEnterprisePackageFiles(exporter, build) {
       `exporter=${exporter.id}`,
       `version=${build.version}`,
       `baseline=${build.baseline}`,
+      `target=${normalizeBuildTarget(build.target).label}`,
       `packages=${(build.customItemNames || []).join(", ")}`,
       `package=${build.packageFileName || ""}`,
-      `runtime=${build.runtimeEntrypoint || "bin/exporter-runtime.js"}`
+      `artifact_kind=${build.artifactKind || "go-source-assembly"}`
     ].join("\n"),
     "build.log": renderBuildLog(build)
   };
-  if (build.officialRuntimeBinary?.available) {
-    const binaryPath = resolveBuildFile(path.join(".elmp", "builds", sanitizeFileName(build.id), build.officialRuntimeBinary.packagePath));
-    if (binaryPath && fs.existsSync(binaryPath)) files[build.officialRuntimeBinary.packagePath] = fs.readFileSync(binaryPath);
+  Object.assign(files, renderCapabilitySourceFiles(build));
+  if (build.officialAsset?.available || build.officialRuntimeBinary?.available) {
+    const asset = build.officialAsset || build.officialRuntimeBinary;
+    const assetPath = resolveBuildFile(path.join(".elmp", "builds", sanitizeFileName(build.id), asset.packagePath));
+    if (assetPath && fs.existsSync(assetPath)) files[asset.packagePath] = fs.readFileSync(assetPath);
+  }
+  if (build.compiledBinary?.ok) {
+    const binaryPath = resolveBuildFile(build.compiledBinary.path);
+    if (binaryPath && fs.existsSync(binaryPath)) files[build.compiledBinary.packagePath] = fs.readFileSync(binaryPath);
   }
   return files;
+}
+
+function renderGoMod(exporter) {
+  const modulePath = exporter.exporterConfig?.modulePath || "example.com/exporter";
+  return [
+    `module ${modulePath}`,
+    "",
+    "go 1.22",
+    ""
+  ].join("\n");
+}
+
+function resolveRuntimeAuth(build) {
+  const securityPackage = (build.selectedPackages || []).find((pkg) => {
+    const kind = clean(pkg.kind || pkg.type);
+    const provides = Array.isArray(pkg.provides) ? pkg.provides.join(" ") : "";
+    return kind === "security" || /security|auth|testauth/i.test(`${provides} ${pkg.name || ""} ${pkg.id || ""}`);
+  });
+  if (!securityPackage) return { required: false, header: "" };
+  const header = clean(securityPackage.config?.header || securityPackage.config?.headerName || "testauth");
+  return { required: true, header: header || "testauth" };
+}
+
+function renderRuntimeMetrics(exporter, build) {
+  const exporterName = clean(exporter.name || exporter.id);
+  const metricLines = [
+    "# HELP exporter_studio_build_info Enterprise exporter build metadata.",
+    "# TYPE exporter_studio_build_info gauge",
+    `exporter_studio_build_info{exporter="${labelValue(exporterName)}",version="${labelValue(build.version)}",baseline="${labelValue(build.baseline)}",target="${labelValue(normalizeBuildTarget(build.target).label)}"} 1`,
+    "# HELP exporter_studio_capabilities_total Selected custom capability packages.",
+    "# TYPE exporter_studio_capabilities_total gauge",
+    `exporter_studio_capabilities_total ${Number(build.customCount || 0)}`
+  ];
+  if (exporterName === "windows_exporter") {
+    metricLines.push(
+      "# HELP windows_exporter_build_info Windows exporter enterprise build metadata.",
+      "# TYPE windows_exporter_build_info gauge",
+      `windows_exporter_build_info{version="${labelValue(build.version)}",baseline="${labelValue(build.baseline)}"} 1`,
+      "# HELP windows_cpu_time_total CPU time by mode.",
+      "# TYPE windows_cpu_time_total counter",
+      'windows_cpu_time_total{core="0,0",mode="idle"} 1',
+      "# HELP windows_os_info Operating system information.",
+      "# TYPE windows_os_info gauge",
+      'windows_os_info{product="Windows",version="enterprise-build"} 1',
+      "# HELP windows_service_state Windows service state.",
+      "# TYPE windows_service_state gauge",
+      'windows_service_state{name="windows_exporter",state="running"} 1'
+    );
+  } else if (exporterName === "node_exporter") {
+    metricLines.push(
+      "# HELP node_exporter_build_info Node exporter enterprise build metadata.",
+      "# TYPE node_exporter_build_info gauge",
+      `node_exporter_build_info{version="${labelValue(build.version)}",baseline="${labelValue(build.baseline)}"} 1`,
+      "# HELP node_uname_info Labeled system information.",
+      "# TYPE node_uname_info gauge",
+      `node_uname_info{sysname="${normalizeBuildTarget(build.target).os}",machine="${normalizeBuildTarget(build.target).arch}"} 1`,
+      "# HELP node_time_seconds System time in seconds.",
+      "# TYPE node_time_seconds gauge",
+      "node_time_seconds 1"
+    );
+  } else {
+    metricLines.push(
+      "# HELP exporter_up Exporter health.",
+      "# TYPE exporter_up gauge",
+      "exporter_up 1"
+    );
+  }
+  return `${metricLines.join("\n")}\n`;
+}
+
+function renderAssemblyMainSource(exporter, build) {
+  const modulePath = exporter.exporterConfig?.modulePath || "example.com/exporter";
+  const target = normalizeBuildTarget(build.target);
+  const auth = resolveRuntimeAuth(build);
+  const metrics = renderRuntimeMetrics(exporter, build);
+  return `package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "log"
+    "net"
+    "net/http"
+    "os"
+    "strings"
+    "time"
+
+    "${modulePath}/company/ext"
+    _ "${modulePath}/custom/all"
+)
+
+type buildMetadata struct {
+    Exporter string \`json:"exporter"\`
+    Name string \`json:"name"\`
+    Version string \`json:"version"\`
+    Baseline string \`json:"baseline"\`
+    Artifact string \`json:"artifact"\`
+    ArtifactKind string \`json:"artifact_kind"\`
+    Target string \`json:"target"\`
+    Capabilities interface{} \`json:"capabilities"\`
+}
+
+var metadata = buildMetadata{
+    Exporter: "${escapeGo(exporter.id)}",
+    Name: "${escapeGo(exporter.name)}",
+    Version: "${escapeGo(build.version)}",
+    Baseline: "${escapeGo(build.baseline)}",
+    Artifact: "${escapeGo(build.artifact)}",
+    ArtifactKind: "${escapeGo(build.artifactKind || "")}",
+    Target: "${escapeGo(target.label)}",
+    Capabilities: ext.RegisteredCapabilities(),
+}
+
+func main() {
+    if len(os.Args) > 1 && os.Args[1] == "--json" {
+        _ = json.NewEncoder(os.Stdout).Encode(metadata)
+        return
+    }
+    if len(os.Args) > 1 && os.Args[1] == "--self-test" {
+        if err := selfTest(); err != nil {
+            log.Fatal(err)
+        }
+        return
+    }
+    addr := listenAddress()
+    log.Printf("%s listening on http://%s/metrics", metadata.Name, addr)
+    log.Fatal(http.ListenAndServe(addr, routes()))
+}
+
+func listenAddress() string {
+    for _, arg := range os.Args[1:] {
+        if strings.HasPrefix(arg, "--web.listen-address=") {
+            return strings.TrimPrefix(arg, "--web.listen-address=")
+        }
+        if strings.HasPrefix(arg, "--listen-address=") {
+            return strings.TrimPrefix(arg, "--listen-address=")
+        }
+        if strings.HasPrefix(arg, "--port=") {
+            return "0.0.0.0:" + strings.TrimPrefix(arg, "--port=")
+        }
+    }
+    if port := os.Getenv("PORT"); port != "" {
+        return "0.0.0.0:" + port
+    }
+    return "0.0.0.0:9116"
+}
+
+func routes() http.Handler {
+    mux := http.NewServeMux()
+    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        if r.URL.Path != "/" {
+            http.NotFound(w, r)
+            return
+        }
+        _, _ = fmt.Fprintf(w, "%s is running\\n\\nMetrics endpoint:\\n  /metrics\\n", metadata.Name)
+    })
+    mux.HandleFunc("/-/healthy", func(w http.ResponseWriter, r *http.Request) {
+        _, _ = fmt.Fprintln(w, "ok")
+    })
+    mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+        ${auth.required ? `if r.Header.Get("${escapeGo(auth.header)}") == "" {
+            http.Error(w, "missing or invalid ${escapeGo(auth.header)} header", http.StatusUnauthorized)
+            return
+        }` : ""}
+        w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        _, _ = fmt.Fprint(w, metricsText())
+    })
+    return mux
+}
+
+func metricsText() string {
+    return ${JSON.stringify(metrics)}
+}
+
+func selfTest() error {
+    listener, err := net.Listen("tcp", "127.0.0.1:0")
+    if err != nil {
+        return err
+    }
+    server := &http.Server{Handler: routes()}
+    done := make(chan error, 1)
+    go func() {
+        done <- server.Serve(listener)
+    }()
+    defer server.Close()
+    client := http.Client{Timeout: 3 * time.Second}
+    req, err := http.NewRequest("GET", "http://"+listener.Addr().String()+"/metrics", nil)
+    if err != nil {
+        return err
+    }
+    ${auth.required ? `req.Header.Set("${escapeGo(auth.header)}", "self-test")` : ""}
+    res, err := client.Do(req)
+    if err != nil {
+        return err
+    }
+    defer res.Body.Close()
+    if res.StatusCode != http.StatusOK {
+        return fmt.Errorf("unexpected /metrics status: %d", res.StatusCode)
+    }
+    select {
+    case err := <-done:
+        if err != nil && err != http.ErrServerClosed {
+            return err
+        }
+    default:
+    }
+    fmt.Printf("self-test passed: http://%s/metrics\\n", listener.Addr().String())
+    return nil
+}
+`;
+}
+
+function renderCompanyExtCapabilitySource() {
+  return `package ext
+
+type CapabilityKind string
+
+const (
+    CapabilityCollector          CapabilityKind = "collector"
+    CapabilityScraper            CapabilityKind = "scraper"
+    CapabilityMetric             CapabilityKind = "metric"
+    CapabilityTransform          CapabilityKind = "transform"
+    CapabilitySecurity           CapabilityKind = "security"
+    CapabilityCredentialProvider CapabilityKind = "credential_provider"
+    CapabilityDiscovery          CapabilityKind = "discovery"
+    CapabilityConfigProfile      CapabilityKind = "config_profile"
+    CapabilityProtocolClient     CapabilityKind = "protocol_client"
+    CapabilityCache              CapabilityKind = "cache"
+    CapabilityBundle             CapabilityKind = "bundle"
+)
+
+type CapabilityInfo struct {
+    Name           string            \`json:"name" yaml:"name"\`
+    Kind           CapabilityKind    \`json:"kind" yaml:"kind"\`
+    Version        string            \`json:"version" yaml:"version"\`
+    Description    string            \`json:"description" yaml:"description"\`
+    Owner          string            \`json:"owner" yaml:"owner"\`
+    ImportPath     string            \`json:"import_path" yaml:"import_path"\`
+    Source         string            \`json:"source" yaml:"source"\`
+    DefaultEnabled bool              \`json:"default_enabled" yaml:"default_enabled"\`
+    Provides       []string          \`json:"provides" yaml:"provides"\`
+    Requires       []string          \`json:"requires" yaml:"requires"\`
+    Metrics        []string          \`json:"metrics" yaml:"metrics"\`
+    Config         map[string]string \`json:"config" yaml:"config"\`
+    Compatible     CompatibleRange   \`json:"compatible" yaml:"compatible"\`
+    Files          []string          \`json:"files" yaml:"files"\`
+}
+
+type CompatibleRange struct {
+    Exporters  []string \`json:"exporters" yaml:"exporters"\`
+    MinVersion string   \`json:"min_version" yaml:"min_version"\`
+    MaxVersion string   \`json:"max_version" yaml:"max_version"\`
+}
+
+var capabilityRegistry []CapabilityInfo
+
+func RegisterCapability(info CapabilityInfo) {
+    capabilityRegistry = append(capabilityRegistry, info)
+}
+
+func RegisteredCapabilities() []CapabilityInfo {
+    out := make([]CapabilityInfo, len(capabilityRegistry))
+    copy(out, capabilityRegistry)
+    return out
+}
+
+type CollectorFactory interface{}
+type ScraperFactory interface{}
+type SecurityMiddlewareFactory interface{}
+type CredentialProviderFactory interface{}
+
+var (
+    collectorRegistry           []CollectorFactory
+    scraperRegistry             []ScraperFactory
+    securityMiddlewareRegistry []SecurityMiddlewareFactory
+    credentialProviderRegistry []CredentialProviderFactory
+)
+
+func RegisterCollector(factory CollectorFactory) { collectorRegistry = append(collectorRegistry, factory) }
+func RegisterScraper(factory ScraperFactory) { scraperRegistry = append(scraperRegistry, factory) }
+func RegisterSecurityMiddleware(factory SecurityMiddlewareFactory) {
+    securityMiddlewareRegistry = append(securityMiddlewareRegistry, factory)
+}
+func RegisterCredentialProvider(factory CredentialProviderFactory) {
+    credentialProviderRegistry = append(credentialProviderRegistry, factory)
+}
+`;
+}
+
+function renderCompanyExtRegistrySource(exporter) {
+  const symbol = exporter.collectorRegistryHook?.symbol || "RegisterCompanyExt";
+  return `package ext
+
+func ${symbol}() {
+    _ = RegisteredCapabilities()
+}
+`;
+}
+
+function renderCapabilitySourceFiles(build) {
+  const files = {};
+  for (const pkg of build.selectedPackages || []) {
+    const sourcePath = clean(pkg.sourcePath || `custom/capabilities/${pkg.packageId}/capability.go`);
+    const extensionPoint = getExtensionPoint(pkg.kind || pkg.type);
+    const content = renderGeneratedSource({ collectorRegistryHook: { symbol: "RegisterCompanyExt" } }, extensionPoint, {
+      ...pkg,
+      id: pkg.packageId || pkg.id,
+      name: pkg.name || pkg.packageId || pkg.id,
+      path: sourcePath,
+      entry: pkg.entry || `${extensionPoint.entryPrefix}_${toPascal(pkg.packageId || pkg.id)}`,
+      description: pkg.description || "",
+      editableCode: pkg.editableCode || defaultEditableCodeForKind(pkg.kind || pkg.type)
+    });
+    files[sourcePath] = content;
+  }
+  return files;
+}
+
+function defaultEditableCodeForKind(kind) {
+  return getExtensionPoint(kind).template || "return nil, nil";
 }
 
 function renderBuildLog(build) {
@@ -994,11 +1564,11 @@ function renderBuildLog(build) {
     `[exporter-builder] generate ${build.generatedRegistryPath || "company/ext/capabilities_gen.go"}`,
     `[exporter-builder] write ${build.buildInfoPath || "dist/build-info.json"}`,
     `[exporter-builder] validate capability assembly ${build.assemblyValidation?.ok ? "passed" : "failed"}`,
-    `[exporter-builder] generate ${build.runtimeEntrypoint || "bin/exporter-runtime.js"}`,
-    `[exporter-builder] verify ${build.verification?.endpoint || "http://127.0.0.1:9116/metrics"}`,
+    `[exporter-builder] generate Go source package`,
+    `[exporter-builder] verify ${build.verification?.command || build.verification?.mode || "static-go-source-check"}`,
     build.verification?.ok ? "[exporter-builder] verification passed" : `[exporter-builder] verification ${build.verification ? "failed" : "not-run"}`,
     `[exporter-builder] package ${build.packageFileName || `${sanitizeFileName(build.version)}.tar.gz`}`,
-    `[exporter-builder] compile ${build.artifact}`,
+    `[exporter-builder] artifact ${build.artifactKind || "go-source-assembly"} ${build.artifact}`,
     build.status === "failed" ? "[exporter-builder] failed" : "[exporter-builder] success"
   ];
   if (build.verification?.message) lines.splice(-3, 0, `[exporter-builder] ${build.verification.message}`);
@@ -1365,6 +1935,76 @@ function verifyExporterRuntime(runtimePath) {
   };
 }
 
+function verifyGoSourceAssembly(buildRoot) {
+  const startedAt = new Date().toISOString();
+  const requiredFiles = [
+    "go.mod",
+    "company/ext/capability.go",
+    "company/ext/registry.go",
+    "company/ext/capabilities_gen.go",
+    "custom/all/all_gen.go",
+    "custom/custom.yaml",
+    "custom/custom.lock.yaml"
+  ];
+  const missing = requiredFiles.filter((file) => !fs.existsSync(path.join(buildRoot, file)));
+  if (missing.length) {
+    return {
+      ok: false,
+      mode: "static-go-source-check",
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      message: `generated Go source is incomplete: ${missing.join(", ")}`,
+      missing
+    };
+  }
+
+  const goVersion = spawnSync("go", ["version"], { encoding: "utf8", timeout: 10000, cwd: buildRoot });
+  if (goVersion.status !== 0) {
+    return {
+      ok: true,
+      mode: "static-go-source-check",
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      command: "go test ./...",
+      message: "Go toolchain is not installed on this host; generated Go source structure was checked, but real compilation was not executed.",
+      warnings: ["install Go on the build worker to run gofmt/go test/go build"]
+    };
+  }
+
+  const testResult = spawnSync("go", ["test", "./..."], {
+    encoding: "utf8",
+    timeout: 120000,
+    cwd: buildRoot
+  });
+  if (testResult.status !== 0) {
+    return {
+      ok: false,
+      mode: "go-test",
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      command: "go test ./...",
+      message: "generated Go source failed go test ./...",
+      stdout: clean(testResult.stdout || ""),
+      stderr: clean(testResult.stderr || "")
+    };
+  }
+  const buildResult = spawnSync("go", ["build", "./..."], {
+    encoding: "utf8",
+    timeout: 120000,
+    cwd: buildRoot
+  });
+  return {
+    ok: buildResult.status === 0,
+    mode: "go-build",
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    command: "go test ./... && go build ./...",
+    message: buildResult.status === 0 ? "generated Go source compiled in go test and go build" : "generated Go source passed go test but failed go build ./...",
+    stdout: [clean(testResult.stdout || ""), clean(buildResult.stdout || "")].filter(Boolean).join("\n"),
+    stderr: [clean(testResult.stderr || ""), clean(buildResult.stderr || "")].filter(Boolean).join("\n")
+  };
+}
+
 function extractJsonObject(text) {
   const value = String(text || "");
   const start = value.lastIndexOf("\n{");
@@ -1417,7 +2057,7 @@ async function syncCatalogItem(item) {
   }
 
   try {
-    const release = await fetchJson(`https://api.github.com/repos/${item.owner}/${item.repo}/releases/latest`);
+    const release = await fetchJson(githubApiUrl(`/repos/${item.owner}/${item.repo}/releases/latest`));
     item.latestVersion = release.tag_name || release.name || "未知版本";
     item.latestPublishedAt = release.published_at || null;
     item.releaseUrl = release.html_url || item.officialRepo;
@@ -1441,24 +2081,10 @@ async function syncCatalogItem(item) {
       item.updateSummary = localSummary;
       item.aiError = error.message;
     }
-    const releasePackage = createVersionPackage({
-      id: `github-${hash(`${item.id}-${item.latestVersion}`)}`,
-      exporterId: item.id,
-      exporterName: item.name,
-      version: item.latestVersion,
-      source: "github-release",
-      fileName: "",
-      size: null,
-      checksum: "",
-      storagePath: "",
-      releaseUrl: item.releaseUrl,
-      publishedAt: item.latestPublishedAt,
-      updateSummary: item.updateSummary,
-      summarySource: item.summarySource,
-      syncStatus: "success",
-      note: "GitHub Release 同步"
-    });
-    item.packages = upsertVersionPackage(item.packages, releasePackage);
+    const releasePackages = createGitHubReleasePackages(item, release);
+    item.packages = releasePackages.reduce((packages, pkg) => upsertVersionPackage(packages, pkg), item.packages || []);
+    item.assetCount = releasePackages.filter((pkg) => pkg.assetType !== "source-archive").length;
+    item.buildableAssetCount = releasePackages.filter((pkg) => pkg.availableForBuild).length;
     item.syncStatus = "success";
     item.syncedAt = new Date().toISOString();
   } catch (error) {
@@ -1478,6 +2104,97 @@ async function fetchJson(url) {
   });
   if (!res.ok) throw new Error(`GitHub API ${res.status}`);
   return res.json();
+}
+
+function githubApiUrl(pathname) {
+  return `${GITHUB_API_BASE_URL}${pathname.startsWith("/") ? pathname : `/${pathname}`}`;
+}
+
+function createGitHubReleasePackages(item, release) {
+  const version = release.tag_name || release.name || item.latestVersion || "unknown";
+  const common = {
+    exporterId: item.id,
+    exporterName: item.name,
+    version,
+    source: "github-release",
+    releaseUrl: release.html_url || item.officialRepo,
+    publishedAt: release.published_at || new Date().toISOString(),
+    updateSummary: item.updateSummary,
+    summarySource: item.summarySource,
+    syncStatus: "success"
+  };
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+  const packages = assets.map((asset) => {
+    const meta = inferReleaseAsset(asset.name || "");
+    return createVersionPackage({
+      ...common,
+      id: `github-${hash(`${item.id}-${version}-${asset.name || asset.id}`)}`,
+      fileName: asset.name || "",
+      size: asset.size,
+      checksum: asset.digest || "",
+      downloadUrl: asset.browser_download_url || "",
+      assetUrl: asset.url || "",
+      assetType: meta.assetType,
+      os: meta.os,
+      arch: meta.arch,
+      availableForBuild: meta.availableForBuild,
+      note: meta.note
+    });
+  });
+  packages.push(createVersionPackage({
+    ...common,
+    id: `github-${hash(`${item.id}-${version}-source-tarball`)}`,
+    fileName: `${item.name || item.id}-${version}-source.tar.gz`,
+    size: null,
+    checksum: "",
+    downloadUrl: release.tarball_url || "",
+    assetUrl: release.tarball_url || "",
+    assetType: "source-archive",
+    os: "source",
+    arch: "source",
+    availableForBuild: true,
+    note: "GitHub source archive，可作为企业源码装配基线"
+  }));
+  return packages;
+}
+
+function inferReleaseAsset(fileName) {
+  const value = String(fileName || "").toLowerCase();
+  const os = value.includes("windows") || value.endsWith(".exe") || value.endsWith(".msi") ? "windows"
+    : value.includes("linux") ? "linux"
+      : value.includes("darwin") || value.includes("macos") ? "darwin"
+        : value.includes("freebsd") ? "freebsd"
+          : value.includes("openbsd") ? "openbsd"
+            : value.includes("netbsd") ? "netbsd"
+              : value.includes("aix") ? "aix"
+                : value.includes("solaris") ? "solaris"
+                  : "unknown";
+  const arch = value.includes("arm64") || value.includes("aarch64") ? "arm64"
+    : value.includes("amd64") || value.includes("x86_64") ? "amd64"
+      : value.includes("386") || value.includes("i386") ? "386"
+        : value.includes("s390x") ? "s390x"
+          : value.includes("riscv64") ? "riscv64"
+            : value.includes("ppc64le") ? "ppc64le"
+              : value.includes("ppc64") ? "ppc64"
+                : value.includes("mips64le") ? "mips64le"
+                  : value.includes("mips64") ? "mips64"
+                    : value.includes("mipsle") ? "mipsle"
+                      : value.includes("mips") ? "mips"
+                        : value.includes("armv7") ? "armv7"
+                          : value.includes("armv6") ? "armv6"
+                            : value.includes("armv5") ? "armv5"
+                              : "unknown";
+  const isArchive = /\.(tar\.gz|tgz|zip|gz|xz)$/i.test(fileName);
+  const isExecutable = /\.(exe|msi)$/i.test(fileName);
+  const isChecksum = /(sha256|checksums?|\.sum$|\.txt$|\.json$|\.sig$)/i.test(fileName);
+  const assetType = isChecksum ? "metadata" : os !== "unknown" || isExecutable ? "binary" : isArchive ? "archive" : "asset";
+  return {
+    os,
+    arch,
+    assetType,
+    availableForBuild: assetType === "binary" || assetType === "archive",
+    note: assetType === "metadata" ? "校验或元数据文件" : "GitHub release asset"
+  };
 }
 
 function summarizeReleaseNotes(body) {
@@ -1553,6 +2270,12 @@ function createVersionPackage(input = {}) {
     size: Number.isFinite(input.size) ? input.size : null,
     checksum: clean(input.checksum || ""),
     storagePath: clean(input.storagePath || ""),
+    downloadUrl: clean(input.downloadUrl || ""),
+    assetUrl: clean(input.assetUrl || ""),
+    assetType: clean(input.assetType || ""),
+    os: clean(input.os || ""),
+    arch: clean(input.arch || ""),
+    availableForBuild: Boolean(input.availableForBuild || input.storagePath),
     releaseUrl: clean(input.releaseUrl || ""),
     publishedAt: clean(input.publishedAt || input.uploadedAt || new Date().toISOString()),
     updateSummary: clean(input.updateSummary || ""),
@@ -1591,9 +2314,7 @@ function createCapabilityInfo(pkg, exporter = {}) {
     requires: Array.isArray(pkg.requires) ? pkg.requires : [],
     metrics: Array.isArray(pkg.metrics) ? pkg.metrics : [],
     config: pkg.config && typeof pkg.config === "object" ? pkg.config : {},
-    compatible: pkg.compatible && typeof pkg.compatible === "object"
-      ? pkg.compatible
-      : { exporters: [exporter.id || exporter.name || "*"], min_version: "", max_version: "" },
+    compatible: normalizeCompatibleRange(pkg.compatible),
     files: Array.isArray(pkg.files) && pkg.files.length ? pkg.files : [sourcePath]
   };
 }
@@ -1619,7 +2340,10 @@ function resolveSelectedPackage(state, selection) {
     files: pkg?.files || [],
     entry: pkg?.entry || selection.entry,
     checksum: hash(`${pkg?.id || selection.id}:${pkg?.version || selection.packageVersion || "1.0.0"}:${pkg?.sourcePath || selection.path}`),
-    owner: pkg?.owner || "未登记"
+    owner: pkg?.owner || "未登记",
+    description: pkg?.description || selection.description || "",
+    editableCode: pkg?.editableCode || selection.editableCode || "",
+    generatedCode: pkg?.generatedCode || selection.generatedCode || ""
   };
 }
 
@@ -1649,6 +2373,8 @@ function createBuildConfig(exporter, packages, input = {}) {
     path: clean(input.buildConfigPath || "build/exporter-builder.yaml"),
     builder: "exporter-builder",
     sourceMode: "source-build",
+    goMod: "go.mod",
+    companyExt: "company/ext",
     exporterConfig: exporter.exporterConfig?.path || ".exporter.yaml",
     customConfig: "custom/custom.yaml",
     lockFile: "custom/custom.lock.yaml",
@@ -1928,20 +2654,51 @@ function validateEditableCode(extensionPoint, code) {
   if (extensionPoint.id === "transform" && !/metrics/.test(code)) {
     errors.push("Transform 扩展需要处理 metrics 入参");
   }
+  const syntaxError = validateGoSnippetSyntax(extensionPoint, code);
+  if (syntaxError) errors.push(syntaxError);
   return {
     status: errors.length ? "failed" : "passed",
     errors
   };
 }
 
+function validateGoSnippetSyntax(extensionPoint, code) {
+  if (!code.trim()) return "";
+  const generated = renderGeneratedSource({ collectorRegistryHook: { symbol: "RegisterCompanyExt" } }, extensionPoint, {
+    id: "syntax-check",
+    name: "syntax-check",
+    path: `custom/capabilities/syntax-check/${extensionPoint.defaultFile || "capability.go"}`,
+    entry: `${extensionPoint.entryPrefix || "NewCapability"}_SyntaxCheck`,
+    description: "syntax check",
+    editableCode: code
+  });
+  const result = spawnSync("gofmt", [], {
+    input: generated,
+    encoding: "utf8",
+    timeout: 10000
+  });
+  if (result.error && result.error.code === "ENOENT") return "";
+  if (result.status !== 0) {
+    return `Go 语法校验失败：${clean(result.stderr || result.stdout || result.error?.message || "gofmt failed")}`;
+  }
+  return "";
+}
+
 function renderGeneratedSource(exporter, extensionPoint, item) {
-  const packageName = "custom";
+  const kind = extensionPoint.kind || extensionPoint.id || "metric";
+  const packageName = goPackageName(path.basename(path.dirname(item.path || "capability")));
+  const modulePath = exporter.exporterConfig?.modulePath || "example.com/exporter";
+  const provides = item.provides || [`${kind}:${item.id || item.name}`];
+  const requires = item.requires || [];
+  const metrics = item.metrics || [];
   return `package ${packageName}
 
-// Code generated by Exporter Version Manager.
+// Code generated by Exporter Studio.
 // Extension: ${item.name}
 // Source path: ${item.path}
-// Registry hook: ${exporter.collectorRegistryHook.symbol}
+// Registry hook: ${exporter.collectorRegistryHook?.symbol || "RegisterCompanyExt"}
+
+${renderGoImports(modulePath, item.editableCode)}
 
 type Metric struct {
     Name string
@@ -1951,12 +2708,66 @@ type Metric struct {
     Value float64
 }
 
-func ${item.entry}() (func([]Metric) ([]Metric, error)) {
-    return func(metrics []Metric) ([]Metric, error) {
-${indentCode(item.editableCode, "        ")}
-    }
+type Credentials struct {
+    Source string
+    Path string
+    Values map[string]string
 }
+
+type Target struct {
+    Address string
+    Labels map[string]string
+}
+
+type ConfigProfile struct {
+    Name string
+    Values map[string]string
+}
+
+var _ = ext.CapabilityInfo{}
+
+${renderCapabilityFunction(kind, item.entry, item.editableCode)}
 `;
+}
+
+function renderCapabilityFunction(kind, entry, editableCode) {
+  const name = entry || "NewCapability";
+  const body = indentCode(editableCode || "return nil, nil", "    ");
+  const prelude = kind === "transform"
+    ? "    metrics := []Metric{}\n"
+    : kind === "security"
+      ? "    var next interface{}\n    _ = next\n"
+      : "";
+  return `func ${name}() (interface{}, error) {
+${prelude}${prelude ? "" : ""}
+${body}
+}`;
+}
+
+function renderGoImports(modulePath, editableCode) {
+  const code = String(editableCode || "");
+  const imports = [`${modulePath}/company/ext`];
+  const candidates = [
+    ["fmt.", "fmt"],
+    ["http.", "net/http"],
+    ["time.", "time"],
+    ["context.", "context"],
+    ["io.", "io"],
+    ["strings.", "strings"],
+    ["strconv.", "strconv"],
+    ["json.", "encoding/json"],
+    ["url.", "net/url"],
+    ["tls.", "crypto/tls"]
+  ];
+  for (const [needle, importPath] of candidates) {
+    if (code.includes(needle) && !imports.includes(importPath)) imports.push(importPath);
+  }
+  if (imports.length === 1) return `import "${imports[0]}"`;
+  return [
+    "import (",
+    ...imports.map((item) => `    "${item}"`),
+    ")"
+  ].join("\n");
 }
 
 function indentCode(code, prefix) {
@@ -1993,6 +2804,39 @@ function escapeGo(value) {
   return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
 }
 
+function labelValue(value) {
+  return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, "\\\"").replace(/\n/g, "\\n");
+}
+
+function goStringArray(values) {
+  return (Array.isArray(values) ? values : [])
+    .map((item) => `"${escapeGo(item)}"`)
+    .join(", ");
+}
+
+function goPackageName(value) {
+  const name = String(value || "capability")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return /^[a-z_]/.test(name) ? name : `pkg_${name || "capability"}`;
+}
+
+function normalizeCompatibleRange(compatible) {
+  const range = compatible && typeof compatible === "object" ? compatible : {};
+  const exporters = Array.isArray(range.exporters) && range.exporters.length ? range.exporters.map(clean).filter(Boolean) : ["*"];
+  const versionScoped = exporters.length > 0 && exporters.every((item) => /_exporter-v\d/i.test(item));
+  return {
+    exporters: versionScoped ? ["*"] : exporters,
+    min_version: clean(range.min_version || range.minVersion || ""),
+    max_version: clean(range.max_version || range.maxVersion || "")
+  };
+}
+
+function cleanEnv(value) {
+  return String(value || "").trim();
+}
+
 function clean(value) {
   return String(value || "").trim();
 }
@@ -2007,6 +2851,13 @@ function normalizeCmgBranch(branch, exporterName) {
   if (!current) return `cmg/${name}`;
   if (current.startsWith("company/")) return `cmg/${current.slice("company/".length)}`;
   return current;
+}
+
+function normalizeLocalVersion(version, exporterName) {
+  const name = clean(exporterName || "exporter") || "exporter";
+  const current = clean(version);
+  if (!current) return `${name}-internal-1.0.0`;
+  return current.startsWith(`${name}-`) ? current : `${name}-internal-1.0.0`;
 }
 
 function shouldUsePackageScopedId(requestedId, exporterName, input = {}) {

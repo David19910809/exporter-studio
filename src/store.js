@@ -284,7 +284,7 @@ function normalizeExporter(exporter) {
     contactInfo: exporter.contactInfo || "",
     localBranch: normalizeCmgBranch(exporter.localBranch, exporter.name || exporter.id),
     companyBranch: normalizeCmgBranch(exporter.companyBranch || exporter.localBranch, exporter.name || exporter.id),
-    localVersion: exporter.localVersion || `${exporter.id || exporter.name}-internal-1.0.0`,
+    localVersion: normalizeLocalVersion(exporter.localVersion, exporter.name || exporter.id),
     customDir: exporter.customDir || "custom",
     collectorRegistryHook: exporter.collectorRegistryHook || {
       file: "collector/registry_custom.go",
@@ -327,7 +327,7 @@ function normalizeCapabilityPackage(pkg) {
     requires: Array.isArray(pkg.requires) ? pkg.requires : [],
     metrics: Array.isArray(pkg.metrics) ? pkg.metrics : [],
     config: pkg.config && typeof pkg.config === "object" ? pkg.config : {},
-    compatible: pkg.compatible && typeof pkg.compatible === "object" ? pkg.compatible : { exporters: ["*"], min_version: "", max_version: "" },
+    compatible: normalizeCompatibleRange(pkg.compatible),
     files: Array.isArray(pkg.files) && pkg.files.length ? pkg.files : [sourcePath],
     entry: pkg.entry || "",
     description: pkg.description || "可复用 custom 能力包",
@@ -361,6 +361,26 @@ function normalizeCmgBranch(branch, exporterName) {
   if (!current) return `cmg/${name}`;
   if (current.startsWith("company/")) return `cmg/${current.slice("company/".length)}`;
   return current;
+}
+
+function normalizeLocalVersion(version, exporterName) {
+  const name = String(exporterName || "exporter").trim() || "exporter";
+  const current = String(version || "").trim();
+  if (!current) return `${name}-internal-1.0.0`;
+  return current.startsWith(`${name}-`) ? current : `${name}-internal-1.0.0`;
+}
+
+function normalizeCompatibleRange(compatible) {
+  const range = compatible && typeof compatible === "object" ? compatible : {};
+  const exporters = Array.isArray(range.exporters) && range.exporters.length
+    ? range.exporters.map((item) => String(item || "").trim()).filter(Boolean)
+    : ["*"];
+  const versionScoped = exporters.length > 0 && exporters.every((item) => /_exporter-v\d/i.test(item));
+  return {
+    exporters: versionScoped ? ["*"] : exporters,
+    min_version: String(range.min_version || range.minVersion || "").trim(),
+    max_version: String(range.max_version || range.maxVersion || "").trim()
+  };
 }
 
 module.exports = {

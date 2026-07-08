@@ -54,10 +54,14 @@ test("build uses enabled custom count", () => {
   assert.equal(build.status, "success");
   assert.equal(build.customCount, 2);
   assert.equal(build.compileMode, "source-build");
-  assert.equal(build.artifactKind, "local-runnable-exporter");
+  assert.equal(build.artifactKind, "go-source-assembly");
   assert.equal(build.verification.ok, true);
   assert.equal(build.downloadReady, true);
-  assert.match(build.runtimeEntrypoint, /exporter-runtime\.js/);
+  assert.equal(build.target.os, "linux");
+  assert.equal(build.target.arch, "amd64");
+  assert.equal(build.target.label, "linux/amd64");
+  assert.match(build.runtimeEntrypoint, /^dist\/snmp_exporter-build-/);
+  assert.equal(build.runtimeEntrypoint.endsWith(".exe"), false);
   assert.equal(build.selectedPackages.some((pkg) => pkg.packageId === "custom-build"), true);
   assert.equal(build.customItemNames.includes("构建指标"), true);
   assert.match(build.registryHook, /RegisterCompanyExt/);
@@ -86,6 +90,25 @@ test("build records support tags and deletion", () => {
   const deleted = deleteBuild(build.id);
   assert.equal(deleted.status, "deleted");
   assert.equal(getDashboard().exporter.builds.some((item) => item.id === build.id), false);
+});
+
+test("build downloads are resolved by build id across enterprise versions", () => {
+  resetState();
+  const firstBuild = createBuild({
+    version: "snmp_exporter-internal-cross-version"
+  });
+  saveExporter({
+    id: "node_exporter-v1-11-1",
+    name: "node_exporter",
+    officialBaseline: "v1.11.1",
+    localVersion: "node_exporter-internal-1.0.0"
+  });
+
+  const artifact = getBuildDownload(firstBuild.id, "artifact");
+
+  assert.match(artifact.content, /snmp_exporter-internal-cross-version/);
+  assert.match(artifact.content, /exporter=snmp_exporter/);
+  assert.equal(getDashboard().exporter.name, "node_exporter");
 });
 
 test("dashboard exposes exporter catalog", () => {
@@ -244,6 +267,19 @@ test("custom extension validation catches unsafe empty code", () => {
   assert.equal(item.validation.status, "failed");
 });
 
+test("custom extension validation catches invalid Go syntax", () => {
+  resetState();
+  const pkg = saveCapabilityPackage({
+    id: "pkg-invalid-go",
+    name: "坏 Go 代码",
+    extensionPoint: "collector",
+    editableCode: "metric := Metric{Name: \"bad\", Value: 1,\nsdfa\n}\nreturn []Metric{metric}, nil"
+  });
+
+  assert.equal(pkg.validation.status, "failed");
+  assert.equal(pkg.validation.errors.some((item) => item.includes("Go 语法校验失败")), true);
+});
+
 test("scraper extension supports external service metric pulling", () => {
   resetState();
   const item = addCustomItem({
@@ -284,6 +320,19 @@ test("capability package is stored as reusable asset without binding exporter ve
   assert.equal(dashboard.exporter.customItems.some((item) => item.packageId === "pkg-http-health"), false);
 });
 
+test("legacy version-scoped capability compatibility is treated as reusable", () => {
+  resetState();
+  const pkg = saveCapabilityPackage({
+    id: "pkg-legacy-auth",
+    name: "旧认证能力",
+    extensionPoint: "security",
+    compatible: { exporters: ["windows_exporter-v0-31-7"], min_version: "", max_version: "" },
+    editableCode: "return next, nil"
+  });
+
+  assert.deepEqual(pkg.compatible.exporters, ["*"]);
+});
+
 test("build assembles selected reusable packages and exposes download payloads", () => {
   resetState();
   saveCapabilityPackage({
@@ -304,6 +353,7 @@ test("build assembles selected reusable packages and exposes download payloads",
   const lock = getBuildDownload(build.id, "lock");
   const assembly = getBuildDownload(build.id, "assembly");
   const enterprisePackage = getBuildDownload(build.id, "package");
+  const binary = getBuildDownload(build.id, "binary");
   const packageContent = zlib.gunzipSync(enterprisePackage.content).toString("utf8");
 
   assert.equal(build.customCount, 2);
@@ -313,13 +363,19 @@ test("build assembles selected reusable packages and exposes download payloads",
   assert.match(assembly.content, /pkg-http-health/);
   assert.equal(enterprisePackage.contentType, "application/gzip");
   assert.match(enterprisePackage.fileName, /snmp_exporter-internal-2\.0\.0\.tar\.gz/);
+  assert.match(packageContent, /go\.mod/);
+  assert.match(packageContent, /cmd\/exporter-studio\/main\.go/);
   assert.match(packageContent, /dist\/build-info\.json/);
   assert.match(packageContent, /custom\/all\/all_gen\.go/);
-  assert.match(packageContent, /bin\/exporter-runtime\.js/);
+  assert.match(packageContent, /company\/ext\/capability\.go/);
+  assert.match(packageContent, /custom\/capabilities\/pkg-http-health\/scraper\/http_health\.go/);
   assert.match(packageContent, /dist\/verification\.json/);
   assert.match(packageContent, /dist\/assembly-validation\.json/);
   assert.equal(build.verification.ok, true);
-  assert.equal(build.verification.metricCount > 0, true);
+  assert.match(build.verification.mode, /go-build|go-test|static-go-source-check/);
+  assert.equal(build.compiledBinary.ok, true);
+  assert.equal(binary.contentType, "application/octet-stream");
+  assert.equal(binary.content.length > 0, true);
 });
 
 test("build validates assembly semantics for every capability kind", () => {
