@@ -330,9 +330,16 @@
                       <label>官方版本包<select id="buildOfficialPackageSelect"></select><small class="field-note">构建只能从已同步或已上传的官方版本包中选择。</small></label>
                       <label>发布版本号<input id="buildVersion" placeholder="不填则自动生成"><small class="field-note">建议使用自动生成；手填时应包含 exporter 名称、企业标识和递增号。</small></label>
                       <label>操作人<input id="buildOperator" value="平台团队"><small class="field-note">用于构建审计和发布记录追踪。</small></label>
-                      <label>目标系统<select id="buildTargetOs"></select><small class="field-note">默认按官方包推断；也可手动指定 linux 或 windows。</small></label>
-                      <label>芯片架构<select id="buildTargetArch"></select><small class="field-note">amd64 对应常见 x86_64；arm64 对应鲲鹏、飞腾等 ARM 64 位。</small></label>
-                      <label id="buildTargetArmLabel">ARM 版本<select id="buildTargetArm"></select><small class="field-note">仅 GOARCH=arm 时需要，常用 v7。</small></label>
+                      <label class="span-2">运行环境<select id="buildTargetPreset"></select><small class="field-note">不知道怎么选时优先选这里。例如 Mac M1/M2/M3/M4 选择“macOS / Apple 芯片”。</small></label>
+                      <div id="buildTargetHelp" class="target-help span-2"></div>
+                      <details class="advanced-build-options span-2">
+                        <summary>高级：手动指定 GOOS / GOARCH</summary>
+                        <div class="form-grid">
+                          <label>目标系统<select id="buildTargetOs"></select><small class="field-note">高级字段。macOS 对应 darwin；Linux 对应 linux；Windows 对应 windows。</small></label>
+                          <label>芯片架构<select id="buildTargetArch"></select><small class="field-note">高级字段。Apple M 系列芯片对应 arm64；Intel/AMD x86_64 对应 amd64。</small></label>
+                          <label id="buildTargetArmLabel">ARM 版本<select id="buildTargetArm"></select><small class="field-note">仅 32 位 ARM 需要，常用 v7；Mac M1 不需要填写。</small></label>
+                        </div>
+                      </details>
                       <label class="span-2">构建标签<input id="buildTags" placeholder="例如：认证, Windows, 回归验证"><small class="field-note">多个标签可用逗号、空格或顿号分隔，用于构建记录搜索。</small></label>
                     </div>
                   </div>
@@ -353,7 +360,10 @@
                     <div class="form-grid">
                       <label>发布说明<input id="buildNote" value="企业内部版本发布"><small class="field-note">写清楚本次发布目的，便于回滚和审计。</small></label>
                       <label>版本补丁说明<input id="buildPatchNote" value="仅保留必要 company/ext 接入点"><small class="field-note">这里只记录主干侵入补丁，能力包不要写成补丁。</small></label>
-                      <label class="span-2">构建参数<input id="buildArgs" value="GOOS=linux GOARCH=amd64"><small class="field-note">默认即可；只有跨平台或特殊 collector 参数才需要修改。</small></label>
+                      <details class="advanced-build-options span-2">
+                        <summary>高级：附加构建参数</summary>
+                        <label>构建参数<input id="buildArgs" value="GOOS=linux GOARCH=amd64"><small class="field-note">通常不用修改；系统会按上面的运行环境自动生成 GOOS / GOARCH。</small></label>
+                      </details>
                     </div>
                   </div>
                 </section>

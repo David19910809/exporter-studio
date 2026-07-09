@@ -324,6 +324,7 @@ function addCustomItem(input = {}) {
     description: clean(input.description || "可复用 custom 能力包"),
     owner: clean(input.owner || "平台团队"),
     status: "active",
+    default_enabled: Boolean(input.default_enabled ?? input.defaultEnabled ?? false),
     provides: Array.isArray(input.provides) ? input.provides : undefined,
     requires: Array.isArray(input.requires) ? input.requires : undefined,
     metrics: Array.isArray(input.metrics) ? input.metrics : undefined,
@@ -400,6 +401,7 @@ function saveCapabilityPackage(input = {}) {
     description: clean(input.description || "可复用 custom 能力包"),
     owner: clean(input.owner || "平台团队"),
     status: clean(input.status || "active"),
+    default_enabled: Boolean(input.default_enabled ?? input.defaultEnabled ?? false),
     provides: Array.isArray(input.provides) ? input.provides : undefined,
     requires: Array.isArray(input.requires) ? input.requires : undefined,
     metrics: Array.isArray(input.metrics) ? input.metrics : undefined,
@@ -463,7 +465,7 @@ function refreshDiffs() {
 function createBuild(input = {}) {
   const state = loadState();
   const exporter = getCurrentExporter(state);
-  const selectedPackage = findCatalogPackage(state, input.officialPackageId || exporter.officialPackageId || exporter.officialBaseline);
+  let selectedPackage = findCatalogPackage(state, input.officialPackageId || exporter.officialPackageId || exporter.officialBaseline);
   if (selectedPackage) {
     exporter.officialPackageId = selectedPackage.id;
     exporter.officialPackageSource = selectedPackage.source;
@@ -491,6 +493,13 @@ function createBuild(input = {}) {
     ? requestedVersion
     : `${exporter.localVersion}+custom.${sequence}`;
   const target = resolveBuildTarget(exporter, selectedPackage, input);
+  selectedPackage = selectOfficialPackageForBuild(state, exporter, selectedPackage, target);
+  if (selectedPackage) {
+    exporter.officialPackageId = selectedPackage.id;
+    exporter.officialPackageSource = selectedPackage.source;
+    exporter.officialPackageFileName = selectedPackage.fileName;
+    exporter.officialBaseline = selectedPackage.version;
+  }
   const lockFile = createCustomLock(exporter, selectedPackages, version);
   const buildConfig = createBuildConfig(exporter, selectedPackages, { ...input, target });
   const build = {
@@ -875,9 +884,11 @@ function buildRealExporterArtifact(exporter, build) {
 
   const verification = verifyGoSourceAssembly(buildRoot);
   const compiledBinary = compileExporterExecutable(buildRoot, build, exporter);
+  const runtimeVerification = verifyCompiledBinaryRuntime(buildRoot, build, exporter, compiledBinary);
   build.verification = verification;
   build.compiledBinary = compiledBinary;
-  build.status = verification.ok && compiledBinary.ok && (build.assemblyValidation?.ok ?? true) ? "success" : "failed";
+  build.runtimeVerification = runtimeVerification;
+  build.status = verification.ok && compiledBinary.ok && (runtimeVerification?.ok ?? true) && (build.assemblyValidation?.ok ?? true) ? "success" : "failed";
   build.runtimeEntrypoint = compiledBinary.ok ? compiledBinary.packagePath : "README.md";
   build.packageFileName = packageFileName;
   build.packagePath = relativePath(packagePath);
@@ -892,6 +903,7 @@ function buildRealExporterArtifact(exporter, build) {
     officialRuntimeBinary: officialAsset,
     officialAsset,
     compiledBinary,
+    runtimeVerification,
     assemblyValidation: build.assemblyValidation,
     verification
   };
@@ -908,6 +920,7 @@ function buildRealExporterArtifact(exporter, build) {
     packagePath: build.packagePath,
     binaryPath: build.binaryPath,
     compiledBinary,
+    runtimeVerification,
     downloadReady: build.downloadReady
   };
 }
@@ -956,6 +969,66 @@ function resolveBuildTarget(exporter, officialPackage, input = {}) {
   };
 }
 
+function selectOfficialPackageForBuild(state, exporter, officialPackage, target) {
+  if (!isWindowsExporter(exporter)) return officialPackage;
+  const normalizedTarget = normalizeBuildTarget(target);
+  const current = normalizeOfficialPackageForTarget(officialPackage, normalizedTarget);
+  if (current && isWindowsExecutablePackage(current) && officialPackageMatchesTarget(current, normalizedTarget)) return current;
+
+  const catalog = findCatalogForExporter(state, exporter);
+  const packages = catalog?.packages || [];
+  const version = clean(officialPackage?.version || exporter.officialBaseline || catalog?.latestVersion || "");
+  const candidates = packages
+    .filter((pkg) => pkg && (!version || pkg.version === version))
+    .map((pkg) => normalizeOfficialPackageForTarget(pkg, normalizedTarget))
+    .filter(Boolean)
+    .filter(isWindowsExecutablePackage);
+
+  return candidates.sort((left, right) => officialPackageBuildScore(left, normalizedTarget) - officialPackageBuildScore(right, normalizedTarget))[0]
+    || officialPackage;
+}
+
+function normalizeOfficialPackageForTarget(pkg, target) {
+  if (!pkg) return null;
+  const inferred = inferReleaseAsset(pkg.fileName || "");
+  return {
+    ...pkg,
+    os: isConcreteGoOS(pkg.os) ? clean(pkg.os) : inferred.os,
+    arch: normalizeGoArch(pkg.arch) || normalizeGoArch(inferred.arch),
+    assetType: pkg.assetType || inferred.assetType,
+    target
+  };
+}
+
+function findCatalogForExporter(state, exporter) {
+  const names = new Set([clean(exporter?.id), clean(exporter?.name), clean(exporter?.exporterName)].filter(Boolean));
+  return (state.exporterCatalog || []).find((item) => names.has(item.id) || names.has(item.name)) || null;
+}
+
+function isWindowsExporter(exporter) {
+  return clean(exporter?.name || exporter?.id || exporter?.exporterName).toLowerCase() === "windows_exporter";
+}
+
+function isWindowsExecutablePackage(pkg) {
+  return clean(pkg?.assetType) === "binary"
+    && clean(pkg?.os) === "windows"
+    && /\.exe$/i.test(clean(pkg?.fileName || pkg?.packagePath || ""));
+}
+
+function officialPackageMatchesTarget(pkg, target) {
+  return clean(pkg?.os) === target.os && (normalizeGoArch(pkg?.arch) || clean(pkg?.arch)) === target.arch;
+}
+
+function officialPackageBuildScore(pkg, target) {
+  let score = 0;
+  if (clean(pkg.os) !== target.os) score += 100;
+  if ((normalizeGoArch(pkg.arch) || clean(pkg.arch)) !== target.arch) score += 100;
+  if (pkg.source === "manual-upload") score -= 10;
+  if (pkg.availableForBuild) score -= 1;
+  if (/\.msi$/i.test(clean(pkg.fileName))) score += 20;
+  return score;
+}
+
 function normalizeBuildTarget(target) {
   const os = isConcreteGoOS(target?.os) ? clean(target.os) : "linux";
   const arch = normalizeGoArch(target?.arch) || "amd64";
@@ -994,8 +1067,30 @@ function normalizeGoArm(value) {
 }
 
 function compileExporterExecutable(buildRoot, build, exporter) {
+  const officialBinary = prepareOfficialBinaryExecutable(buildRoot, build, exporter);
+  if (officialBinary.ok) return officialBinary;
+  if (isWindowsExporter(exporter) && clean(build.officialAsset?.assetType) === "binary") {
+    return {
+      ...officialBinary,
+      ok: false,
+      source: "official-binary",
+      message: officialBinary.message || officialBinary.reason || "Official windows_exporter binary is not usable for the selected target",
+      fallbackBlocked: true,
+      fallbackBlockedReason: "windows_exporter 必须使用匹配目标架构的官方 exe；不能降级生成模拟程序，否则会丢失默认 windows_ 指标。"
+    };
+  }
   const officialSource = compileOfficialSourceExecutable(buildRoot, build, exporter);
   if (officialSource.ok) return officialSource;
+  if (requiresOfficialSourceExecutable(exporter, build)) {
+    return {
+      ...officialSource,
+      ok: false,
+      source: "official-source",
+      message: officialSource.message || officialSource.reason || "Official exporter source build failed",
+      fallbackBlocked: true,
+      fallbackBlockedReason: "真实 exporter 必须由官方源码编译成功；不能降级为 generated-assembly，否则会丢失官方默认指标。"
+    };
+  }
   const generated = compileGoExecutable(buildRoot, build);
   return {
     ...generated,
@@ -1004,12 +1099,69 @@ function compileExporterExecutable(buildRoot, build, exporter) {
   };
 }
 
+function prepareOfficialBinaryExecutable(buildRoot, build, exporter) {
+  const asset = build.officialAsset;
+  if (!asset?.available || clean(asset.assetType) !== "binary") {
+    return { ok: false, source: "official-binary", reason: "official binary asset is not available" };
+  }
+  if (!isWindowsExporter(exporter)) {
+    return { ok: false, source: "official-binary", reason: "official binary pass-through is only enabled for windows_exporter" };
+  }
+  const target = normalizeBuildTarget(build.target);
+  const normalizedAsset = normalizeOfficialPackageForTarget(asset, target);
+  if (!isWindowsExecutablePackage(normalizedAsset)) {
+    return { ok: false, source: "official-binary", reason: "official asset is not a Windows exe binary" };
+  }
+  if (normalizedAsset.os !== target.os || normalizedAsset.arch !== target.arch) {
+    return {
+      ok: false,
+      source: "official-binary",
+      reason: `official binary target mismatch: asset=${normalizedAsset.os}/${normalizedAsset.arch || "unknown"} build=${target.label}`
+    };
+  }
+  if ((build.selectedPackages || []).length > 0) {
+    return {
+      ok: false,
+      source: "official-binary",
+      reason: "official windows_exporter binaries cannot embed selected custom capability packages yet"
+    };
+  }
+  const source = path.join(buildRoot, asset.packagePath || "");
+  if (!fs.existsSync(source)) {
+    return { ok: false, source: "official-binary", reason: "official binary file is missing" };
+  }
+  const fileName = `${sanitizeFileName(exporter.name || build.exporterName || "windows_exporter")}-${sanitizeFileName(build.id || "build")}.exe`;
+  const packagePath = `dist/${fileName}`;
+  const output = path.join(buildRoot, packagePath);
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  fs.copyFileSync(source, output);
+  const body = fs.readFileSync(output);
+  return {
+    ok: true,
+    source: "official-binary",
+    command: `copy ${asset.packagePath} ${packagePath}`,
+    target,
+    packagePath,
+    path: relativePath(output),
+    fileName,
+    size: body.length,
+    sha256: crypto.createHash("sha256").update(body).digest("hex"),
+    message: "Official windows_exporter binary packaged successfully"
+  };
+}
+
+function requiresOfficialSourceExecutable(exporter, build) {
+  const exporterName = clean(exporter?.name || exporter?.id || build?.exporterName || build?.exporter || "");
+  if (exporterName === "node_exporter") return true;
+  return clean(build?.officialAsset?.assetType) === "source-archive" && Boolean(build?.officialAsset?.available);
+}
+
 function compileOfficialSourceExecutable(buildRoot, build, exporter) {
   if (!build.officialAsset?.available || clean(build.officialAsset.assetType) !== "source-archive") {
     return { ok: false, source: "official-source", reason: "official source archive is not available" };
   }
-  const sourceArchive = resolveBuildFile(path.join(".elmp", "builds", sanitizeFileName(build.id), build.officialAsset.packagePath));
-  if (!sourceArchive || !fs.existsSync(sourceArchive)) {
+  const sourceArchive = path.join(buildRoot, build.officialAsset.packagePath || "");
+  if (!fs.existsSync(sourceArchive)) {
     return { ok: false, source: "official-source", reason: "official source archive file is missing" };
   }
   const sourceRoot = path.join(buildRoot, "official-source");
@@ -1041,7 +1193,8 @@ function compileOfficialSourceExecutable(buildRoot, build, exporter) {
     GOARCH: target.arch,
     ...(target.arm ? { GOARM: target.arm } : {})
   };
-  const result = spawnSync("go", ["build", "-o", output, "."], {
+  const goCommand = resolveGoTool("go");
+  const result = spawnSync(goCommand, ["build", "-o", output, "."], {
     cwd: sourceRoot,
     encoding: "utf8",
     env,
@@ -1206,7 +1359,8 @@ function compileGoExecutable(buildRoot, build) {
     GOARCH: target.arch,
     ...(target.arm ? { GOARM: target.arm } : {})
   };
-  const result = spawnSync("go", ["build", "-o", output, "./cmd/exporter-studio"], {
+  const goCommand = resolveGoTool("go");
+  const result = spawnSync(goCommand, ["build", "-o", output, "./cmd/exporter-studio"], {
     cwd: buildRoot,
     encoding: "utf8",
     env,
@@ -1806,10 +1960,16 @@ function renderBuildLog(build) {
     `[exporter-builder] verify ${build.verification?.command || build.verification?.mode || "static-go-source-check"}`,
     build.verification?.ok ? "[exporter-builder] verification passed" : `[exporter-builder] verification ${build.verification ? "failed" : "not-run"}`,
     `[exporter-builder] binary source ${build.compiledBinary?.source || "generated-assembly"}`,
+    build.compiledBinary?.fallbackBlocked ? `[exporter-builder] fallback blocked: ${build.compiledBinary.fallbackBlockedReason}` : "",
+    build.compiledBinary?.stderr ? `[exporter-builder] binary stderr ${build.compiledBinary.stderr}` : "",
+    build.compiledBinary?.reason ? `[exporter-builder] binary reason ${build.compiledBinary.reason}` : "",
+    build.runtimeVerification ? `[exporter-builder] runtime metrics ${build.runtimeVerification.ok ? "passed" : "failed"} ${build.runtimeVerification.endpoint || build.runtimeVerification.message || ""}` : "",
+    build.runtimeVerification?.windowsMetricCount ? `[exporter-builder] windows metrics ${build.runtimeVerification.windowsMetricCount}` : "",
+    build.runtimeVerification?.stderr ? `[exporter-builder] runtime stderr ${build.runtimeVerification.stderr}` : "",
     `[exporter-builder] package ${build.packageFileName || `${sanitizeFileName(build.version)}.tar.gz`}`,
     `[exporter-builder] artifact ${build.artifactKind || "go-source-assembly"} ${build.artifact}`,
     build.status === "failed" ? "[exporter-builder] failed" : "[exporter-builder] success"
-  ];
+  ].filter(Boolean);
   if (build.verification?.message) lines.splice(-3, 0, `[exporter-builder] ${build.verification.message}`);
   return lines.join("\n");
 }
@@ -2174,6 +2334,123 @@ function verifyExporterRuntime(runtimePath) {
   };
 }
 
+function verifyCompiledBinaryRuntime(buildRoot, build, exporter, compiledBinary) {
+  if (!compiledBinary?.ok) return null;
+  if (!isWindowsExporter(exporter) || compiledBinary.source !== "official-binary") return null;
+  if (process.platform !== "win32") {
+    return {
+      ok: true,
+      skipped: true,
+      mode: "compiled-binary-runtime",
+      message: "runtime metrics verification skipped because the build worker is not Windows"
+    };
+  }
+  if (Number(compiledBinary.size || 0) < 1024 * 1024) {
+    return {
+      ok: true,
+      skipped: true,
+      mode: "compiled-binary-runtime",
+      message: "runtime metrics verification skipped because the binary is too small to be an official exporter executable"
+    };
+  }
+
+  const binaryPath = path.join(buildRoot, compiledBinary.packagePath || "");
+  if (!fs.existsSync(binaryPath)) {
+    return {
+      ok: false,
+      mode: "compiled-binary-runtime",
+      message: "compiled binary file is missing"
+    };
+  }
+  const startedAt = new Date().toISOString();
+  const port = 52000 + Math.floor(Math.random() * 10000);
+  const script = `
+const { spawn } = require("node:child_process");
+const http = require("node:http");
+
+(async () => {
+  const [exe, portText] = process.argv.slice(1);
+  const port = Number(portText);
+  const child = spawn(exe, [\`--web.listen-address=127.0.0.1:\${port}\`], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", chunk => { stdout += chunk.toString(); });
+  child.stderr.on("data", chunk => { stderr += chunk.toString(); });
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const request = () => new Promise((resolve, reject) => {
+    const req = http.get({ hostname: "127.0.0.1", port, path: "/metrics", timeout: 10000 }, res => {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", chunk => { body += chunk; });
+      res.on("end", () => resolve({ statusCode: res.statusCode, body }));
+    });
+    req.on("timeout", () => req.destroy(new Error("metrics request timeout")));
+    req.on("error", reject);
+  });
+  let result = null;
+  try {
+    for (let i = 0; i < 30; i += 1) {
+      if (child.exitCode !== null) break;
+      await sleep(1000);
+      try {
+        result = await request();
+        if (result.statusCode === 200) break;
+      } catch {}
+    }
+    const body = result?.body || "";
+    const lines = body.split(/\\r?\\n/).filter(Boolean);
+    const metricLines = lines.filter(line => !line.startsWith("#"));
+    const windowsLines = metricLines.filter(line => line.startsWith("windows_"));
+    const ok = result?.statusCode === 200 && windowsLines.length > 0 && body.includes("windows_exporter_build_info");
+    console.log(JSON.stringify({
+      ok,
+      endpoint: \`http://127.0.0.1:\${port}/metrics\`,
+      statusCode: result?.statusCode || 0,
+      lineCount: lines.length,
+      metricCount: metricLines.length,
+      windowsMetricCount: windowsLines.length,
+      hasBuildInfo: body.includes("windows_exporter_build_info"),
+      sample: windowsLines.slice(0, 8),
+      stdout: stdout.slice(0, 2000),
+      stderr: stderr.slice(0, 2000),
+      exitCode: child.exitCode
+    }));
+  } finally {
+    if (child.exitCode === null) child.kill();
+  }
+})().catch(error => {
+  console.log(JSON.stringify({ ok: false, message: error.message }));
+  process.exit(1);
+});
+`;
+  const result = spawnSync(process.execPath, ["-e", script, binaryPath, String(port)], {
+    encoding: "utf8",
+    timeout: 45000
+  });
+  let parsed = null;
+  try {
+    parsed = result.stdout ? JSON.parse(extractJsonObject(result.stdout)) : null;
+  } catch {
+    parsed = null;
+  }
+  return {
+    ok: result.status === 0 && Boolean(parsed?.ok),
+    mode: "compiled-binary-runtime",
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    command: `${compiledBinary.fileName || path.basename(binaryPath)} --web.listen-address=127.0.0.1:${port}`,
+    endpoint: parsed?.endpoint || "",
+    statusCode: parsed?.statusCode || 0,
+    metricCount: parsed?.metricCount || 0,
+    windowsMetricCount: parsed?.windowsMetricCount || 0,
+    hasBuildInfo: Boolean(parsed?.hasBuildInfo),
+    sample: parsed?.sample || [],
+    message: parsed?.ok ? "compiled exporter /metrics verification passed" : (parsed?.message || "compiled exporter /metrics verification failed"),
+    stdout: clean(parsed?.stdout || result.stdout || ""),
+    stderr: clean(parsed?.stderr || result.stderr || result.error?.message || "")
+  };
+}
+
 function verifyGoSourceAssembly(buildRoot) {
   const startedAt = new Date().toISOString();
   const requiredFiles = [
@@ -2197,7 +2474,8 @@ function verifyGoSourceAssembly(buildRoot) {
     };
   }
 
-  const goVersion = spawnSync("go", ["version"], { encoding: "utf8", timeout: 10000, cwd: buildRoot });
+  const goCommand = resolveGoTool("go");
+  const goVersion = spawnSync(goCommand, ["version"], { encoding: "utf8", timeout: 10000, cwd: buildRoot });
   if (goVersion.status !== 0) {
     return {
       ok: true,
@@ -2210,7 +2488,7 @@ function verifyGoSourceAssembly(buildRoot) {
     };
   }
 
-  const testResult = spawnSync("go", ["test", "./..."], {
+  const testResult = spawnSync(goCommand, ["test", "./..."], {
     encoding: "utf8",
     timeout: 120000,
     cwd: buildRoot
@@ -2227,7 +2505,7 @@ function verifyGoSourceAssembly(buildRoot) {
       stderr: clean(testResult.stderr || "")
     };
   }
-  const buildResult = spawnSync("go", ["build", "./..."], {
+  const buildResult = spawnSync(goCommand, ["build", "./..."], {
     encoding: "utf8",
     timeout: 120000,
     cwd: buildRoot
@@ -2951,7 +3229,7 @@ function validateGoSnippetSyntax(extensionPoint, code) {
     description: "syntax check",
     editableCode: code
   });
-  const result = spawnSync("gofmt", [], {
+  const result = spawnSync(resolveGoTool("gofmt"), [], {
     input: generated,
     encoding: "utf8",
     timeout: 10000
@@ -2971,6 +3249,7 @@ function renderGeneratedSource(exporter, extensionPoint, item) {
   const requires = item.requires || [];
   const metrics = item.metrics || [];
   const entry = item.entry || "NewCapability";
+  const editableCode = stripGoImportDeclarations(item.editableCode || "");
   return `package ${packageName}
 
 // Code generated by Exporter Studio.
@@ -3008,7 +3287,7 @@ var _ = ext.CapabilityInfo{}
 
 ${renderCollectorRegistration(kind, item, entry)}
 
-${renderCapabilityFunction(kind, entry, item.editableCode)}
+${renderCapabilityFunction(kind, entry, editableCode)}
 `;
 }
 
@@ -3068,7 +3347,14 @@ func toExtMetrics(metrics []Metric) []ext.Metric {
 
 function renderGoImports(modulePath, editableCode) {
   const code = String(editableCode || "");
-  const imports = [`${modulePath}/company/ext`];
+  const detectionCode = stripGoStringsAndComments(code);
+  const imports = new Map();
+  const addImport = (spec) => {
+    const normalized = normalizeGoImportSpec(spec);
+    if (!normalized) return;
+    imports.set(importSpecKey(normalized), normalized);
+  };
+  addImport(`"${modulePath}/company/ext"`);
   const candidates = [
     ["fmt.", "fmt"],
     ["http.", "net/http"],
@@ -3081,15 +3367,93 @@ function renderGoImports(modulePath, editableCode) {
     ["url.", "net/url"],
     ["tls.", "crypto/tls"]
   ];
+  for (const spec of extractGoImportSpecs(code)) addImport(spec);
   for (const [needle, importPath] of candidates) {
-    if (code.includes(needle) && !imports.includes(importPath)) imports.push(importPath);
+    const packageName = needle.replace(".", "");
+    const selector = new RegExp(`(^|[^A-Za-z0-9_])${escapeRegExp(packageName)}\\s*\\.`, "m");
+    if (selector.test(detectionCode)) addImport(`"${importPath}"`);
   }
-  if (imports.length === 1) return `import "${imports[0]}"`;
+  const specs = Array.from(imports.values());
+  if (specs.length === 1) return `import ${specs[0]}`;
   return [
     "import (",
-    ...imports.map((item) => `    "${item}"`),
+    ...specs.map((item) => `    ${item}`),
     ")"
   ].join("\n");
+}
+
+function stripGoStringsAndComments(code) {
+  return String(code || "")
+    .replace(/`[\s\S]*?`/g, "")
+    .replace(/"([^"\\]|\\.)*"/g, "")
+    .replace(/\/\/.*$/gm, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+}
+
+function extractGoImportSpecs(code) {
+  const specs = [];
+  const lines = String(code || "").split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("import")) continue;
+    const single = trimmed.match(/^import\s+(.+)$/);
+    if (single && !single[1].startsWith("(")) {
+      const spec = normalizeGoImportSpec(single[1]);
+      if (spec) specs.push(spec);
+      continue;
+    }
+    if (!/^import\s*\(\s*$/.test(trimmed)) continue;
+    index += 1;
+    for (; index < lines.length; index += 1) {
+      const bodyLine = lines[index].trim();
+      if (bodyLine === ")") break;
+      const spec = normalizeGoImportSpec(bodyLine);
+      if (spec) specs.push(spec);
+    }
+  }
+  return specs;
+}
+
+function stripGoImportDeclarations(code) {
+  const lines = String(code || "").split("\n");
+  const kept = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = lines[index].trim();
+    if (!trimmed.startsWith("import")) {
+      kept.push(lines[index]);
+      continue;
+    }
+    const single = trimmed.match(/^import\s+(.+)$/);
+    if (single && !single[1].startsWith("(")) continue;
+    if (/^import\s*\(\s*$/.test(trimmed)) {
+      index += 1;
+      for (; index < lines.length; index += 1) {
+        if (lines[index].trim() === ")") break;
+      }
+      continue;
+    }
+    kept.push(lines[index]);
+  }
+  return kept.join("\n").trim();
+}
+
+function normalizeGoImportSpec(spec) {
+  let value = String(spec || "").trim();
+  if (!value || value.startsWith("//")) return "";
+  value = value.replace(/\s+\/\/.*$/, "").replace(/\s+\/\*.*?\*\/\s*$/, "").trim();
+  const match = value.match(/^(?:(\.|_|[A-Za-z_][A-Za-z0-9_]*)\s+)?("([^"\\]|\\.)+")$/);
+  if (!match) return "";
+  return match[1] ? `${match[1]} ${match[2]}` : match[2];
+}
+
+function importSpecKey(spec) {
+  const match = String(spec || "").match(/"([^"]+)"/);
+  return match ? match[1] : spec;
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function indentCode(code, prefix) {
@@ -3168,6 +3532,31 @@ function cleanEnv(value) {
 
 function clean(value) {
   return String(value || "").trim();
+}
+
+function resolveGoTool(tool) {
+  const executable = process.platform === "win32" && !/\.exe$/i.test(tool) ? `${tool}.exe` : tool;
+  const pathHit = findExecutableOnPath(executable);
+  if (pathHit) return pathHit;
+  const candidates = [
+    process.env.GOROOT ? path.join(process.env.GOROOT, "bin", executable) : "",
+    path.join("C:\\", "Tools", "Go", "go1.26.4", "bin", executable),
+    path.join("C:\\", "Program Files", "Go", "bin", executable),
+    path.join("C:\\", "Program Files (x86)", "Go", "bin", executable)
+  ].filter(Boolean);
+  return candidates.find((candidate) => fs.existsSync(candidate)) || tool;
+}
+
+function findExecutableOnPath(executable) {
+  const entries = String(process.env.PATH || process.env.Path || "")
+    .split(path.delimiter)
+    .map((entry) => clean(entry))
+    .filter(Boolean);
+  for (const entry of entries) {
+    const candidate = path.join(entry, executable);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return "";
 }
 
 function sanitizeFileName(value) {

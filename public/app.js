@@ -124,6 +124,51 @@ let lastSavedCapabilityId = "";
 let activeBuild = null;
 let buildSearchQuery = "";
 
+const buildTargetPresets = [
+  {
+    id: "linux-amd64",
+    label: "Linux 服务器 / Intel、AMD x86_64",
+    os: "linux",
+    arch: "amd64",
+    note: "适合大多数 Linux 物理机、虚拟机和云主机，产物没有 .exe 后缀。"
+  },
+  {
+    id: "linux-arm64",
+    label: "Linux 服务器 / ARM 64 位",
+    os: "linux",
+    arch: "arm64",
+    note: "适合鲲鹏、飞腾、Ampere、AWS Graviton 等 ARM 64 位 Linux 服务器。"
+  },
+  {
+    id: "darwin-arm64",
+    label: "macOS / Apple 芯片 M1、M2、M3、M4",
+    os: "darwin",
+    arch: "arm64",
+    note: "适合 Apple Silicon Mac。真实 node_exporter 的部分 macOS collector 依赖 CGO/macOS SDK，建议在 macOS 构建机执行；Windows 交叉编译可能失败。"
+  },
+  {
+    id: "darwin-amd64",
+    label: "macOS / Intel 芯片",
+    os: "darwin",
+    arch: "amd64",
+    note: "适合较早的 Intel Mac。真实 node_exporter 的部分 macOS collector 依赖 CGO/macOS SDK，建议在 macOS 构建机执行；Windows 交叉编译可能失败。"
+  },
+  {
+    id: "windows-amd64",
+    label: "Windows / Intel、AMD x86_64",
+    os: "windows",
+    arch: "amd64",
+    note: "适合常见 64 位 Windows 服务器，产物会带 .exe 后缀。"
+  },
+  {
+    id: "custom",
+    label: "其他系统或架构",
+    os: "",
+    arch: "",
+    note: "用于 FreeBSD、AIX、s390x、32 位 ARM 等特殊环境，请展开高级字段手动填写。"
+  }
+];
+
 qsa(".nav-item").forEach((item) => {
   item.addEventListener("click", () => setView(item.dataset.view));
 });
@@ -239,12 +284,20 @@ on("#buildExporterSelect", "change", async () => {
   await selectExporterVersion(value("#buildExporterSelect"), { silent: true });
   setView("delivery");
 });
-["#buildOfficialPackageSelect", "#buildVersion", "#buildOperator", "#buildNote", "#buildPatchNote", "#buildArgs", "#buildTargetOs", "#buildTargetArch", "#buildTargetArm"].forEach((selector) => {
+["#buildOfficialPackageSelect", "#buildVersion", "#buildOperator", "#buildNote", "#buildPatchNote", "#buildArgs", "#buildTargetPreset", "#buildTargetOs", "#buildTargetArch", "#buildTargetArm"].forEach((selector) => {
   on(selector, "input", renderBuildAssemblyPreview);
   on(selector, "change", renderBuildAssemblyPreview);
 });
 on("#buildOfficialPackageSelect", "change", syncBuildTargetFromPackage);
+on("#buildTargetPreset", "change", applyBuildTargetPreset);
 on("#buildTargetArch", "change", updateBuildTargetArmVisibility);
+["#buildTargetOs", "#buildTargetArch", "#buildTargetArm"].forEach((selector) => {
+  on(selector, "change", () => {
+    syncBuildTargetPresetFromFields();
+    updateBuildTargetHelp();
+    updateBuildArgsFromTarget();
+  });
+});
 on("#buildPackageChecklist", "change", renderBuildAssemblyPreview);
 
 on("#saveExporterBtn", "click", saveExporterMetadata);
@@ -555,13 +608,13 @@ function renderCatalog(catalog) {
     <div class="row catalog-row">
       <div>
         <strong>${esc(item.name)} <span class="muted">/ ${esc(item.category)}</span></strong>
-        <span class="catalog-meta">${esc(formatDate(item.latestPublishedAt))} / ${esc(labelSummarySource(item.summarySource))} / release 资产 ${esc(item.assetCount ?? (item.packages || []).filter((pkg) => pkg.assetType !== "source-archive").length)} 个 / 可装配 ${esc(item.buildableAssetCount ?? (item.packages || []).filter((pkg) => pkg.availableForBuild).length)} 个</span>
+        <span class="catalog-meta">${esc(formatDate(item.latestPublishedAt))} / ${esc(labelSummarySource(item.summarySource))} / 最新官方版本 ${esc(item.latestVersion || "-")}</span>
         <small>${esc(item.updateSummary)}</small>
         ${renderPackagePreview(item.packages || [], item)}
       </div>
       <span class="badge">${esc(item.latestVersion)}</span>
       <span class="badge status-${esc(item.syncStatus)}">${esc(labelSync(item.syncStatus))}</span>
-      <button class="secondary" data-build-from-catalog data-catalog-id="${esc(item.id || item.name)}" data-package-id="${esc((item.packages || [])[0]?.id || "")}">构建企业版</button>
+      <button class="secondary" data-build-from-catalog data-catalog-id="${esc(item.id || item.name)}" data-package-id="${esc(preferredCatalogPackage(item.packages || [], "", item)?.id || "")}">构建企业版</button>
       <a class="link-button" href="${esc(item.releaseUrl || item.officialRepo)}" target="_blank" rel="noreferrer">Release</a>
     </div>
   `).join("") : `<div class="empty">暂无 exporter 目录数据。</div>`);
@@ -569,12 +622,13 @@ function renderCatalog(catalog) {
 
 function renderPackagePreview(packages, catalogItem = {}) {
   if (!packages.length) return "";
+  const versions = groupOfficialPackages(packages, catalogItem);
   return `
     <div class="package-list">
-      ${packages.slice(0, 5).map((pkg) => `
+      ${versions.map((group) => `
         <div class="package-option">
-          <span class="package-pill">${esc(pkg.version)} / ${esc(labelPackageSource(pkg.source))} / ${esc(labelAssetType(pkg.assetType))}${pkg.os ? ` / ${esc(pkg.os)}` : ""}${pkg.arch ? ` / ${esc(pkg.arch)}` : ""}${pkg.fileName ? ` / ${esc(pkg.fileName)}` : ""}</span>
-          <button class="secondary mini" data-build-from-package data-catalog-id="${esc(catalogItem.id || catalogItem.name || "")}" data-package-id="${esc(pkg.id)}">构建企业版</button>
+          <span class="package-pill">${esc(group.version)} / ${esc(labelPackageSource(group.primary?.source))} / ${esc(labelAssetType(group.primary?.assetType))}${group.primary?.fileName ? ` / ${esc(group.primary.fileName)}` : ""}</span>
+          <small>${esc(summarizePackagePlatforms(group.packages))}</small>
         </div>
       `).join("")}
     </div>
@@ -640,20 +694,22 @@ function renderBuildWizard(data) {
 
   const packages = getCatalogPackages(exporter.name);
   html("#buildOfficialPackageSelect", packages.length ? packages.map((pkg) => `
-    <option value="${esc(pkg.id)}">${esc(pkg.version)} / ${esc(labelPackageSource(pkg.source))}${pkg.fileName ? ` / ${esc(pkg.fileName)}` : ""}</option>
+    <option value="${esc(pkg.id)}">${esc(labelOfficialPackageOption(pkg))}</option>
   `).join("") : `<option value="">暂无可选官方版本包</option>`);
-  setValue("#buildOfficialPackageSelect", exporter.officialPackageId || packages.find((pkg) => pkg.version === exporter.officialBaseline)?.id || packages[0]?.id || "");
+  const currentOfficialPackage = normalizeOfficialPackageChoice(findCatalogByName(exporter.name), findPackageById(exporter.officialPackageId));
+  setValue("#buildOfficialPackageSelect", currentOfficialPackage?.id || packages.find((pkg) => pkg.version === exporter.officialBaseline)?.id || packages[0]?.id || "");
   renderBuildTargetOptions();
   syncBuildTargetFromPackage({ preserveManual: true });
   if (!value("#buildVersion")) setValue("#buildVersion", `${exporter.localVersion}+custom.${(exporter.builds?.length || 0) + 1}`);
 
   const selectedIds = new Set((exporter.customItems || []).filter((item) => item.status === "enabled").map((item) => item.packageId || item.id));
   html("#buildPackageChecklist", (data.capabilityPackages || []).length ? data.capabilityPackages.map((pkg) => `
-    <label class="package-check">
-      <input type="checkbox" value="${esc(pkg.id)}" ${selectedIds.has(pkg.id) ? "checked" : ""}>
+    <label class="package-check ${isCapabilityCompatibleWithExporter(pkg, exporter) ? "" : "disabled"}">
+      <input type="checkbox" value="${esc(pkg.id)}" ${selectedIds.has(pkg.id) && isCapabilityCompatibleWithExporter(pkg, exporter) ? "checked" : ""} ${isCapabilityCompatibleWithExporter(pkg, exporter) ? "" : "disabled"}>
       <span>
         <strong>${esc(pkg.name)}</strong>
         <small>${esc(labelType(pkg.kind || pkg.type))} / ${esc(pkg.version)} / ${esc(pkg.sourcePath)}</small>
+        ${isCapabilityCompatibleWithExporter(pkg, exporter) ? "" : `<small class="field-note">不兼容当前 ${esc(exporter.name)}，${esc(labelCapabilityCompatibility(pkg))}</small>`}
       </span>
     </label>
   `).join("") : `<div class="empty">暂无能力包，请先到“定制开发”新增。</div>`);
@@ -662,6 +718,9 @@ function renderBuildWizard(data) {
 }
 
 function renderBuildTargetOptions() {
+  html("#buildTargetPreset", buildTargetPresets.map((preset) => `
+    <option value="${esc(preset.id)}">${esc(preset.label)}</option>
+  `).join(""));
   html("#buildTargetOs", [
     ["linux", "Linux"],
     ["windows", "Windows"],
@@ -700,8 +759,62 @@ function syncBuildTargetFromPackage(options = {}) {
   if (!options.preserveManual || !value("#buildTargetOs")) setValue("#buildTargetOs", target.os);
   if (!options.preserveManual || !value("#buildTargetArch")) setValue("#buildTargetArch", target.arch);
   if (!options.preserveManual || !value("#buildTargetArm")) setValue("#buildTargetArm", target.arm || "");
+  syncBuildTargetPresetFromFields();
   updateBuildTargetArmVisibility();
+  updateBuildTargetHelp();
+  updateBuildArgsFromTarget();
   renderBuildAssemblyPreview();
+}
+
+function applyBuildTargetPreset() {
+  const preset = getBuildTargetPreset(value("#buildTargetPreset"));
+  if (!preset || preset.id === "custom") {
+    updateBuildTargetHelp();
+    renderBuildAssemblyPreview();
+    return;
+  }
+  setValue("#buildTargetOs", preset.os);
+  setValue("#buildTargetArch", preset.arch);
+  setValue("#buildTargetArm", preset.arm || "");
+  updateBuildTargetArmVisibility();
+  updateBuildTargetHelp();
+  updateBuildArgsFromTarget();
+  renderBuildAssemblyPreview();
+}
+
+function syncBuildTargetPresetFromFields() {
+  const preset = findBuildTargetPreset({
+    os: value("#buildTargetOs"),
+    arch: value("#buildTargetArch"),
+    arm: value("#buildTargetArm")
+  });
+  setValue("#buildTargetPreset", preset?.id || "custom");
+}
+
+function updateBuildTargetHelp() {
+  const target = {
+    os: value("#buildTargetOs"),
+    arch: value("#buildTargetArch"),
+    arm: value("#buildTargetArm")
+  };
+  const preset = getBuildTargetPreset(value("#buildTargetPreset")) || findBuildTargetPreset(target);
+  const rawTarget = rawBuildTargetLabel(target);
+  const commandEnv = buildTargetEnv(target);
+  const outputName = target.os === "windows" ? "node_exporter.exe" : "node_exporter";
+  html("#buildTargetHelp", `
+    <strong>${esc(preset?.label || "自定义运行环境")}</strong>
+    <span>${esc(preset?.note || "请确认目标系统和芯片架构与实际运行机器一致。")}</span>
+    <small>构建目标：${esc(rawTarget || "-")}；环境变量：${esc(commandEnv || "-")}；产物示例：${esc(outputName)}</small>
+  `);
+}
+
+function updateBuildArgsFromTarget() {
+  const env = buildTargetEnv({
+    os: value("#buildTargetOs"),
+    arch: value("#buildTargetArch"),
+    arm: value("#buildTargetArm")
+  });
+  if (env) setValue("#buildArgs", env);
 }
 
 function updateBuildTargetArmVisibility() {
@@ -764,7 +877,9 @@ function renderBuildAssemblyPreview() {
   const rows = [
     ["企业版本", `${exporter.name} / ${value("#buildVersion") || "自动生成"}`],
     ["官方基线包", officialPkg ? `${officialPkg.version} / ${labelPackageSource(officialPkg.source)}` : exporter.officialBaseline],
+    ["运行环境", getBuildTargetPreset(value("#buildTargetPreset"))?.label || "其他系统或架构"],
     ["目标平台", labelBuildTarget({ os: value("#buildTargetOs"), arch: value("#buildTargetArch"), arm: value("#buildTargetArm") })],
+    ["构建环境变量", buildTargetEnv({ os: value("#buildTargetOs"), arch: value("#buildTargetArch"), arm: value("#buildTargetArm") })],
     ["稳定扩展接口", exporter.companyExt?.path || "company/ext"],
     ["装配清单", "custom/custom.yaml"],
     ["锁定文件", "custom/custom.lock.yaml"],
@@ -802,8 +917,12 @@ function renderBuilds(exporters) {
         <small>构建参数：${esc(build.manualConfig?.args || "-")} / 操作人：${esc(build.manualConfig?.operator || "-")}</small>
         ${build.assemblyValidation ? `<small>装配验证：${build.assemblyValidation.ok ? "通过" : "失败"} / ${esc(build.assemblyValidation.packageCount || 0)} 个能力包 / 覆盖 ${esc(countCoveredKinds(build.assemblyValidation.kindCoverage))} 类</small>` : ""}
         ${build.verification ? `<small>源码验证：${build.verification.ok ? "通过" : "失败"} / ${esc(build.verification.mode || build.verification.command || "static-go-source-check")} / ${esc(build.verification.message || "")}</small>` : ""}
+        ${build.runtimeVerification ? `<small>运行指标验证：${build.runtimeVerification.ok ? "通过" : "失败"} / windows 指标 ${esc(build.runtimeVerification.windowsMetricCount || 0)} 个 / ${esc(build.runtimeVerification.endpoint || build.runtimeVerification.message || "")}</small>` : ""}
         ${build.packageFileName ? `<small>产物类型：${esc(labelArtifactKind(build.artifactKind))} / 目标平台：${esc(labelBuildTarget(build.target || build.compiledBinary?.target))} / 下载包：${esc(build.packageFileName)}</small>` : ""}
         ${build.compiledBinary?.ok ? `<small>二进制：${esc(build.compiledBinary.fileName || build.runtimeEntrypoint || "")}</small>` : ""}
+        ${build.compiledBinary && !build.compiledBinary.ok ? `<small class="conflict-text">二进制失败：${esc(build.compiledBinary.message || build.compiledBinary.reason || "官方源码编译失败")}</small>` : ""}
+        ${build.compiledBinary?.fallbackBlockedReason ? `<small class="conflict-text">${esc(build.compiledBinary.fallbackBlockedReason)}</small>` : ""}
+        ${build.compiledBinary?.stderr ? `<small class="conflict-text">${esc(shortError(build.compiledBinary.stderr))}</small>` : ""}
         <div class="build-tag-editor">
           <input data-build-tags-input="${esc(build.id)}" value="${esc((build.tags || []).join("，"))}" placeholder="标签：认证，回归，Windows">
           <button class="secondary mini" data-save-build-tags data-build-id="${esc(build.id)}">保存标签</button>
@@ -923,9 +1042,10 @@ function createExporterDraft(options = {}) {
     : findCatalogByName(activeName) || (dashboard?.exporterCatalog || [])[0] || null;
   const name = catalog?.name || activeName || "snmp_exporter";
   const packages = catalog?.packages || [];
-  const pkg = options.packageId
+  const requestedPackage = options.packageId
     ? findPackageById(options.packageId)
-    : packages.find((item) => item.id === dashboard?.exporter?.officialPackageId || item.version === dashboard?.exporter?.officialBaseline) || packages[0] || null;
+    : packages.find((item) => item.id === dashboard?.exporter?.officialPackageId || item.version === dashboard?.exporter?.officialBaseline);
+  const pkg = normalizeOfficialPackageChoice(catalog, requestedPackage) || preferredCatalogPackage(packages, "", catalog) || null;
   const baseline = pkg?.version || (dashboard?.exporter?.name === name ? dashboard?.exporter?.officialBaseline : catalog?.latestVersion) || "v0.30.0";
   return {
     id: makeEnterpriseVersionId(name, pkg?.version || pkg?.id || baseline),
@@ -1026,9 +1146,10 @@ function normalizeCmgBranch(branch, exporterName) {
 function renderOfficialPackageOptions(exporter) {
   const packages = getCatalogPackages(exporter.name);
   html("#officialPackageId", packages.length ? packages.map((pkg) => `
-    <option value="${esc(pkg.id)}">${esc(pkg.version)} / ${esc(labelPackageSource(pkg.source))}${pkg.fileName ? ` / ${esc(pkg.fileName)}` : ""}</option>
+    <option value="${esc(pkg.id)}">${esc(labelOfficialPackageOption(pkg))}</option>
   `).join("") : `<option value="">目录暂无可选版本包</option>`);
-  const preferred = exporter.officialPackageId || packages.find((pkg) => pkg.version === exporter.officialBaseline)?.id || packages[0]?.id || "";
+  const current = normalizeOfficialPackageChoice(findCatalogByName(exporter.name), findPackageById(exporter.officialPackageId));
+  const preferred = current?.id || packages.find((pkg) => pkg.version === exporter.officialBaseline)?.id || packages[0]?.id || "";
   setValue("#officialPackageId", preferred);
   const pkg = findPackageById(preferred);
   if (pkg) {
@@ -1171,7 +1292,7 @@ function getExtensionPoint(id) {
 
 function getCatalogPackages(exporterName) {
   const catalog = (dashboard?.exporterCatalog || []).find((item) => item.id === exporterName || item.name === exporterName);
-  return catalog?.packages || [];
+  return getSelectableOfficialPackages(catalog?.packages || [], catalog);
 }
 
 function findPackageById(id) {
@@ -1185,6 +1306,93 @@ function findPackageById(id) {
 
 function findCatalogByName(name) {
   return (dashboard?.exporterCatalog || []).find((item) => item.id === name || item.name === name);
+}
+
+function getSelectableOfficialPackages(packages, catalog = null) {
+  return groupOfficialPackages(packages, catalog)
+    .map((group) => group.primary)
+    .filter(Boolean);
+}
+
+function groupOfficialPackages(packages, catalog = null) {
+  const groups = new Map();
+  for (const pkg of packages || []) {
+    const version = pkg.version || "unknown";
+    if (!groups.has(version)) groups.set(version, []);
+    groups.get(version).push(pkg);
+  }
+  return Array.from(groups.entries()).map(([version, items]) => ({
+    version,
+    packages: items,
+    primary: preferredCatalogPackage(items, "", catalog)
+  }));
+}
+
+function preferredCatalogPackage(packages, version = "", catalog = null) {
+  const candidates = (packages || [])
+    .filter((pkg) => !version || pkg.version === version)
+    .filter((pkg) => pkg && pkg.id && pkg.assetType !== "metadata");
+  if (!candidates.length) return null;
+  return candidates.slice().sort((left, right) => officialPackageScore(left, catalog) - officialPackageScore(right, catalog))[0];
+}
+
+function normalizeOfficialPackageChoice(catalog, pkg) {
+  if (!pkg) return null;
+  if (["manual-upload", "source-archive"].includes(pkg.source) || pkg.assetType === "source-archive") return pkg;
+  return preferredCatalogPackage(catalog?.packages || [], pkg.version, catalog) || pkg;
+}
+
+function officialPackageScore(pkg, catalog = null) {
+  const exporterName = String(catalog?.name || catalog?.id || pkg.exporterName || pkg.exporterId || "").toLowerCase();
+  if (exporterName === "windows_exporter") {
+    if (pkg.source === "manual-upload") return 0;
+    if (pkg.assetType === "binary" && pkg.os === "windows" && pkg.arch === "amd64" && /\.exe$/i.test(pkg.fileName || "")) return 1;
+    if (pkg.assetType === "binary" && pkg.os === "windows" && /\.exe$/i.test(pkg.fileName || "")) return 2;
+    if (pkg.assetType === "binary" && pkg.os === "windows") return 3;
+    if (pkg.assetType === "source-archive") return 6;
+    return 9;
+  }
+  if (pkg.source === "manual-upload") return 0;
+  if (pkg.assetType === "source-archive") return 1;
+  if (pkg.availableForBuild && pkg.assetType !== "metadata") return 5;
+  return 9;
+}
+
+function summarizePackagePlatforms(packages) {
+  const assets = (packages || []).filter((pkg) => pkg.assetType !== "source-archive" && pkg.assetType !== "metadata");
+  if (!assets.length) return "官方源码基线；构建时选择目标系统和芯片架构。";
+  const systems = Array.from(new Set(assets.map((pkg) => pkg.os).filter((item) => item && item !== "unknown" && item !== "source")));
+  const archs = Array.from(new Set(assets.map((pkg) => pkg.arch).filter((item) => item && item !== "unknown" && item !== "source")));
+  const systemText = systems.length ? systems.slice(0, 4).join("、") : "多平台";
+  const archText = archs.length ? archs.slice(0, 5).join("、") : "多架构";
+  return `平台资产已收起：${systemText}${systems.length > 4 ? "等" : ""}；架构：${archText}${archs.length > 5 ? "等" : ""}。`;
+}
+
+function labelOfficialPackageOption(pkg) {
+  if (!pkg) return "-";
+  const kind = pkg.source === "manual-upload" ? "手动上传固定包" : pkg.assetType === "source-archive" ? "源码基线包" : labelAssetType(pkg.assetType);
+  return `${pkg.version} / ${kind}${pkg.fileName ? ` / ${pkg.fileName}` : ""}`;
+}
+
+function isCapabilityCompatibleWithExporter(pkg, exporter = {}) {
+  const exporters = Array.isArray(pkg?.compatible?.exporters) && pkg.compatible.exporters.length
+    ? pkg.compatible.exporters
+    : ["*"];
+  if (exporters.includes("*")) return true;
+  const candidates = [
+    exporter.id,
+    exporter.name,
+    String(exporter.id || "").replace(/-v\d.*$/i, ""),
+    String(exporter.name || "").replace(/-v\d.*$/i, "")
+  ].filter(Boolean);
+  return exporters.some((item) => candidates.includes(item));
+}
+
+function labelCapabilityCompatibility(pkg) {
+  const exporters = Array.isArray(pkg?.compatible?.exporters) && pkg.compatible.exporters.length
+    ? pkg.compatible.exporters
+    : ["*"];
+  return exporters.includes("*") ? "可用于全部 exporter" : `仅兼容 ${exporters.join("、")}`;
 }
 
 function readFileAsBase64(file) {
@@ -1421,8 +1629,37 @@ function labelArtifactKind(kind) {
 function labelBuildTarget(target) {
   if (!target) return "-";
   if (typeof target === "string") return target;
+  const raw = rawBuildTargetLabel(target);
+  const preset = findBuildTargetPreset(target);
+  if (target.label && target.label !== raw) return target.label;
+  return preset ? `${preset.label}（${raw}）` : raw || "-";
+}
+
+function rawBuildTargetLabel(target) {
+  if (!target) return "";
   const suffix = target.arch === "arm" && target.arm ? `v${target.arm}` : "";
-  return target.label || [target.os, `${target.arch || ""}${suffix}`].filter(Boolean).join("/") || "-";
+  return [target.os, `${target.arch || ""}${suffix}`].filter(Boolean).join("/");
+}
+
+function buildTargetEnv(target) {
+  const os = target?.os || "";
+  const arch = target?.arch || "";
+  if (!os || !arch) return "";
+  return [`GOOS=${os}`, `GOARCH=${arch}`, arch === "arm" && target.arm ? `GOARM=${target.arm}` : ""].filter(Boolean).join(" ");
+}
+
+function getBuildTargetPreset(id) {
+  return buildTargetPresets.find((preset) => preset.id === id) || null;
+}
+
+function findBuildTargetPreset(target = {}) {
+  const os = target.os || "";
+  const arch = target.arch || "";
+  const arm = target.arm || "";
+  return buildTargetPresets.find((preset) => preset.id !== "custom"
+    && preset.os === os
+    && preset.arch === arch
+    && (preset.arm || "") === arm) || null;
 }
 
 function labelValidation(status) {
@@ -1458,6 +1695,10 @@ function labelPreview(file) {
     registry: "company/ext/capabilities_gen.go",
     log: "构建日志"
   }[file] || labelDownload(file);
+}
+
+function shortError(value) {
+  return String(value || "").replace(/\s+/g, " ").slice(0, 260);
 }
 
 function countCoveredKinds(kindCoverage) {

@@ -123,6 +123,83 @@ test("build target can be manually selected for arm and amd architectures", () =
   assert.equal(amd64Build.compiledBinary.target.arch, "amd64");
 });
 
+test("windows exporter builds use matching official exe instead of generated fallback", () => {
+  resetState();
+  const officialDir = path.join(DATA_DIR, "fixtures");
+  fs.mkdirSync(officialDir, { recursive: true });
+  const sourcePath = path.join(officialDir, "windows_exporter-v0.31.7-source.tar.gz");
+  const arm64Path = path.join(officialDir, "windows_exporter-0.31.7-arm64.exe");
+  const binaryPath = path.join(officialDir, "windows_exporter-0.31.7-amd64.exe");
+  fs.writeFileSync(sourcePath, Buffer.from("fake source archive"));
+  fs.writeFileSync(arm64Path, Buffer.from("fake windows arm64 exe"));
+  fs.writeFileSync(binaryPath, Buffer.from("fake windows exe"));
+
+  const state = JSON.parse(fs.readFileSync(STORE_FILE, "utf8"));
+  const catalog = state.exporterCatalog.find((item) => item.id === "windows_exporter");
+  catalog.packages = [
+    {
+      id: "windows-source",
+      exporterId: "windows_exporter",
+      exporterName: "windows_exporter",
+      version: "v0.31.7",
+      source: "github",
+      fileName: "windows_exporter-v0.31.7-source.tar.gz",
+      assetType: "source-archive",
+      os: "source",
+      arch: "source",
+      storagePath: sourcePath,
+      availableForBuild: true
+    },
+    {
+      id: "windows-arm64-exe",
+      exporterId: "windows_exporter",
+      exporterName: "windows_exporter",
+      version: "v0.31.7",
+      source: "github",
+      fileName: "windows_exporter-0.31.7-arm64.exe",
+      assetType: "binary",
+      os: "windows",
+      arch: "arm64",
+      storagePath: arm64Path,
+      availableForBuild: true
+    },
+    {
+      id: "windows-amd64-exe",
+      exporterId: "windows_exporter",
+      exporterName: "windows_exporter",
+      version: "v0.31.7",
+      source: "github",
+      fileName: "windows_exporter-0.31.7-amd64.exe",
+      assetType: "binary",
+      os: "windows",
+      arch: "amd64",
+      storagePath: binaryPath,
+      availableForBuild: true
+    }
+  ];
+  fs.writeFileSync(STORE_FILE, JSON.stringify(state, null, 2), "utf8");
+
+  saveExporter({
+    id: "windows_exporter",
+    name: "windows_exporter",
+    officialPackageId: "windows-arm64-exe",
+    localVersion: "windows_exporter-internal-1.0.0"
+  });
+  const build = createBuild({
+    selectedPackageIds: [],
+    targetOs: "windows",
+    targetArch: "amd64",
+    version: "windows_exporter-internal-1.0.0"
+  });
+  const binary = getBuildDownload(build.id, "binary");
+
+  assert.equal(build.status, "success");
+  assert.equal(build.officialPackageId, "windows-amd64-exe");
+  assert.equal(build.compiledBinary.source, "official-binary");
+  assert.equal(build.compiledBinary.fileName.endsWith(".exe"), true);
+  assert.deepEqual(binary.content, Buffer.from("fake windows exe"));
+});
+
 test("build downloads are resolved by build id across enterprise versions", () => {
   resetState();
   const firstBuild = createBuild({
@@ -309,6 +386,40 @@ test("custom extension validation catches invalid Go syntax", () => {
 
   assert.equal(pkg.validation.status, "failed");
   assert.equal(pkg.validation.errors.some((item) => item.includes("Go 语法校验失败")), true);
+});
+
+test("capability snippets can declare imports that are hoisted into generated Go files", () => {
+  resetState();
+  const pkg = saveCapabilityPackage({
+    id: "pkg-imported-collector",
+    name: "引入包采集器",
+    extensionPoint: "collector",
+    path: "custom/capabilities/pkg-imported-collector/collector/company_collector.go",
+    editableCode: `import (
+    "strings"
+    "net/url"
+)
+endpoint := strings.TrimSpace("http://127.0.0.1:9100/metrics")
+parsed, err := url.Parse(endpoint)
+if err != nil {
+    return nil, err
+}
+metric := Metric{Name: "imported_collector_up", Type: "gauge", Labels: map[string]string{"host": parsed.Host}, Value: 1}
+return []Metric{metric}, nil`
+  });
+
+  assert.equal(pkg.validation.status, "passed");
+  assert.match(pkg.generatedCode, /import \([\s\S]*"net\/url"[\s\S]*\)/);
+  assert.match(pkg.generatedCode, /import \([\s\S]*"strings"[\s\S]*\)/);
+  assert.doesNotMatch(pkg.generatedCode.match(/func NewCompanyCollector_PkgImportedCollector\(\) \(\[\]Metric, error\) \{[\s\S]*?\n\}/)?.[0] || "", /^\s*import\s/m);
+
+  const build = createBuild({
+    selectedPackageIds: ["pkg-imported-collector"],
+    version: "snmp_exporter-imported-collector"
+  });
+  assert.equal(build.status, "success");
+  assert.equal(build.verification.ok, true);
+  assert.equal(build.compiledBinary.ok, true);
 });
 
 test("scraper extension supports external service metric pulling", () => {
